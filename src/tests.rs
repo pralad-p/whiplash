@@ -17,7 +17,6 @@ fn raw_item_with_parts(name: &str, parts: Vec<RawPart>) -> RawItem {
     RawItem {
         name: name.into(),
         parts: Some(parts),
-        anchored: None,
         flags: None,
         ignore_atoms: None,
     }
@@ -145,7 +144,6 @@ fn compile_item_with_wildcard_regex_between_atoms() {
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
     assert_eq!(item.name, "entry");
-    assert!(!item.anchored);
     assert!(item.pattern.is_match("INFO something happened"));
 }
 
@@ -174,7 +172,6 @@ fn compile_item_no_parts_rejected() {
     let raw = RawItem {
         name: "bad".into(),
         parts: None,
-        anchored: None,
         flags: None,
         ignore_atoms: None,
     };
@@ -266,16 +263,6 @@ fn compile_item_ignore_set_merges_blacklist_and_item() {
     let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
     assert!(item.ignore_set.contains(&"timestamp".to_string()));
     assert!(item.ignore_set.contains(&"level".to_string()));
-}
-
-#[test]
-fn compile_item_anchored() {
-    let atoms = make_atoms();
-    let parts = atom_parts(&["level"], None);
-    let mut raw = raw_item_with_parts("entry", parts);
-    raw.anchored = Some(true);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
-    assert!(item.anchored);
 }
 
 #[test]
