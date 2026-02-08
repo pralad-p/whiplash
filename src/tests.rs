@@ -75,16 +75,16 @@ fn make_parsed_item(
 
 fn count_events(result: &CompareResult) -> (usize, usize, usize) {
     let mut matches = 0;
-    let mut mismatches = 0;
     let mut extras = 0;
+    let mut missing = 0;
     for e in &result.events {
         match e {
             CompareEvent::Match { .. } => matches += 1,
-            CompareEvent::Mismatch { .. } => mismatches += 1,
-            CompareEvent::DirtyExtra { .. } => extras += 1,
+            CompareEvent::Extra { .. } => extras += 1,
+            CompareEvent::Missing { .. } => missing += 1,
         }
     }
-    (matches, mismatches, extras)
+    (matches, extras, missing)
 }
 
 // ── split_lines_keepends ─────────────────────────────────────────────
@@ -471,10 +471,10 @@ fn compare_identical_items() {
         .map(|i| make_parsed_item("entry", i + 1, &format!("line {}", i), vec!["A"]))
         .collect();
     let result = compare(&items, &items, 0, 0);
-    let (m, mm, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 3);
-    assert_eq!(mm, 0);
     assert_eq!(ex, 0);
+    assert_eq!(mi, 0);
     assert!(!result.stopped);
 }
 
@@ -483,10 +483,10 @@ fn compare_all_different() {
     let clean = vec![make_parsed_item("entry", 1, "a", vec!["A"])];
     let dirty = vec![make_parsed_item("entry", 1, "b", vec!["B"])];
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, mm, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 0);
-    assert_eq!(mm, 1);
-    assert_eq!(ex, 1); // dirty[0] becomes trailing extra
+    assert_eq!(ex, 1); // dirty[0] is extra
+    assert_eq!(mi, 1); // clean[0] is missing
 }
 
 #[test]
@@ -497,9 +497,10 @@ fn compare_dirty_has_extra_items() {
         make_parsed_item("e", 2, "b", vec!["B"]),
     ];
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, _, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 1);
     assert_eq!(ex, 1);
+    assert_eq!(mi, 0);
 }
 
 #[test]
@@ -510,9 +511,10 @@ fn compare_clean_has_more_items() {
     ];
     let dirty = vec![make_parsed_item("e", 1, "a", vec!["A"])];
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, mm, _) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 1);
-    assert_eq!(mm, 1); // second clean item has no candidate
+    assert_eq!(ex, 0);
+    assert_eq!(mi, 1); // second clean item is missing
 }
 
 #[test]
@@ -527,10 +529,10 @@ fn compare_threshold_allows_offset_match() {
         make_parsed_item("e", 3, "b", vec!["B"]),
     ];
     let result = compare(&clean, &dirty, 1, 0);
-    let (m, mm, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 2);
-    assert_eq!(mm, 0);
     assert_eq!(ex, 1); // dirty[0] "X" is an extra
+    assert_eq!(mi, 0);
 }
 
 #[test]
@@ -545,10 +547,11 @@ fn compare_threshold_zero_strict() {
         make_parsed_item("e", 2, "a", vec!["A"]),
     ];
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, mm, _) = count_events(&result);
-    // With threshold=0 each clean[i] can only look at dirty[i], no match
+    let (m, ex, mi) = count_events(&result);
+    // With threshold=0 each dirty[i] can only look at clean[i], no match
     assert_eq!(m, 0);
-    assert_eq!(mm, 2);
+    assert_eq!(ex, 2);
+    assert_eq!(mi, 2);
 }
 
 #[test]
@@ -562,10 +565,11 @@ fn compare_early_stop() {
     let result = compare(&clean, &dirty, 0, 2);
     assert!(result.stopped);
     assert!(result.stop_reason.is_some());
-    // Should stop after 2 consecutive failures, not process all 5
-    let (m, mm, _) = count_events(&result);
+    // Should stop after 2 consecutive dirty extras, not process all 5
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 0);
-    assert_eq!(mm, 2);
+    assert_eq!(ex, 2);
+    assert_eq!(mi, 0); // no missing appended when stopped
 }
 
 #[test]
@@ -582,8 +586,9 @@ fn compare_early_stop_disabled_with_zero() {
     ];
     let result = compare(&clean, &dirty, 0, 0);
     assert!(!result.stopped);
-    let (_, mm, _) = count_events(&result);
-    assert_eq!(mm, 3); // all processed
+    let (_, ex, mi) = count_events(&result);
+    assert_eq!(ex, 3); // all dirty processed as extras
+    assert_eq!(mi, 3); // all clean are missing
 }
 
 #[test]
@@ -595,17 +600,17 @@ fn compare_failed_run_resets_on_match() {
         make_parsed_item("e", 4, "d", vec!["D"]),
     ];
     let dirty = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]), // match for clean[0], reset
-        make_parsed_item("e", 2, "x", vec!["X"]), // mismatch for clean[1], fail=1
-        make_parsed_item("e", 3, "c", vec!["C"]), // extra(dirty[1]) fail=2, then match clean[2], reset
-        make_parsed_item("e", 4, "d", vec!["D"]), // match for clean[3]
+        make_parsed_item("e", 1, "a", vec!["A"]), // matches clean[0], reset
+        make_parsed_item("e", 2, "x", vec!["X"]), // extra, fail=1
+        make_parsed_item("e", 3, "c", vec!["C"]), // matches clean[2], reset
+        make_parsed_item("e", 4, "d", vec!["D"]), // matches clean[3]
     ];
     let result = compare(&clean, &dirty, 0, 10);
     assert!(!result.stopped);
-    let (m, mm, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 3);
-    assert_eq!(mm, 1);
     assert_eq!(ex, 1);
+    assert_eq!(mi, 1); // clean[1] "B" is missing
 }
 
 #[test]
@@ -616,38 +621,41 @@ fn compare_dirty_extras_before_match() {
         make_parsed_item("e", 2, "b", vec!["B"]),
     ];
     let result = compare(&clean, &dirty, 1, 0);
-    let (m, _, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 1);
     assert_eq!(ex, 1); // dirty[0] is extra
+    assert_eq!(mi, 0);
 }
 
 #[test]
-fn compare_mismatch_reason_no_candidate() {
+fn compare_dirty_empty() {
     let clean = vec![
         make_parsed_item("e", 1, "a", vec!["A"]),
         make_parsed_item("e", 2, "b", vec!["B"]),
     ];
     let dirty = vec![]; // no dirty items at all
     let result = compare(&clean, &dirty, 0, 0);
-    let (_, mm, _) = count_events(&result);
-    assert_eq!(mm, 2);
-    if let CompareEvent::Mismatch { reason, .. } = &result.events[0] {
-        assert!(reason.contains("no candidate"));
-    } else {
-        panic!("expected mismatch event");
-    }
+    let (m, ex, mi) = count_events(&result);
+    assert_eq!(m, 0);
+    assert_eq!(ex, 0);
+    assert_eq!(mi, 2);
 }
 
 #[test]
-fn compare_mismatch_reason_no_match_within_window() {
-    let clean = vec![make_parsed_item("e", 1, "a", vec!["A"])];
-    let dirty = vec![make_parsed_item("e", 1, "b", vec!["B"])];
-    let result = compare(&clean, &dirty, 0, 0);
-    if let CompareEvent::Mismatch { reason, .. } = &result.events[0] {
-        assert!(reason.contains("no match within window"));
-    } else {
-        panic!("expected mismatch event");
-    }
+fn compare_threshold_handles_swap() {
+    let clean = vec![
+        make_parsed_item("e", 1, "a", vec!["A"]),
+        make_parsed_item("e", 2, "b", vec!["B"]),
+    ];
+    let dirty = vec![
+        make_parsed_item("e", 1, "b", vec!["B"]),
+        make_parsed_item("e", 2, "a", vec!["A"]),
+    ];
+    let result = compare(&clean, &dirty, 1, 0);
+    let (m, ex, mi) = count_events(&result);
+    assert_eq!(m, 2);
+    assert_eq!(ex, 0);
+    assert_eq!(mi, 0);
 }
 
 // ── Integration: parse + compare ─────────────────────────────────────
@@ -659,10 +667,10 @@ fn integration_identical_logs() {
     let (clean, _) = parse_log(log, &config);
     let (dirty, _) = parse_log(log, &config);
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, mm, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 2);
-    assert_eq!(mm, 0);
     assert_eq!(ex, 0);
+    assert_eq!(mi, 0);
 }
 
 #[test]
@@ -675,9 +683,10 @@ fn integration_divergence_at_third_line() {
     let (clean, _) = parse_log(clean_log, &config);
     let (dirty, _) = parse_log(dirty_log, &config);
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, mm, _) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 2);
-    assert_eq!(mm, 1);
+    assert_eq!(ex, 1); // dirty[2] is extra
+    assert_eq!(mi, 1); // clean[2] is missing
 }
 
 #[test]
@@ -697,9 +706,10 @@ fn integration_blacklist_ignores_timestamp() {
     let (clean, _) = parse_log(clean_log, &config);
     let (dirty, _) = parse_log(dirty_log, &config);
     let result = compare(&clean, &dirty, 0, 0);
-    let (m, mm, _) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 1);
-    assert_eq!(mm, 0);
+    assert_eq!(ex, 0);
+    assert_eq!(mi, 0);
 }
 
 #[test]
@@ -710,9 +720,10 @@ fn integration_dirty_extra_at_start() {
     let (clean, _) = parse_log(clean_log, &config);
     let (dirty, _) = parse_log(dirty_log, &config);
     let result = compare(&clean, &dirty, 1, 0);
-    let (m, _, ex) = count_events(&result);
+    let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 1);
     assert_eq!(ex, 1);
+    assert_eq!(mi, 0);
 }
 
 #[test]
