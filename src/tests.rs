@@ -736,52 +736,100 @@ fn integration_unparsed_lines_skipped() {
     assert_eq!(unparsed, vec![1, 3]);
 }
 
+// ── clean_log_content ────────────────────────────────────────────────
+
+#[test]
+fn clean_log_literal_backslash_n() {
+    // Literal \n (two chars: backslash + n) replaced with actual newline
+    let input = "hello\\nworld";
+    let output = clean_log_content(input);
+    assert_eq!(output, "hello\nworld");
+}
+
+#[test]
+fn clean_log_literal_backslash_r_backslash_n() {
+    // Literal \r\n (four chars) replaced with actual newline
+    let input = "hello\\r\\nworld";
+    let output = clean_log_content(input);
+    assert_eq!(output, "hello\nworld");
+}
+
+#[test]
+fn clean_log_no_double_newline() {
+    // Literal \n followed by actual newline should not produce double newline
+    let input = "hello\\n\nworld";
+    let output = clean_log_content(input);
+    assert_eq!(output, "hello\nworld");
+}
+
+#[test]
+fn clean_log_crlf_no_double_newline() {
+    // Literal \r\n followed by actual newline should not produce double newline
+    let input = "hello\\r\\n\nworld";
+    let output = clean_log_content(input);
+    assert_eq!(output, "hello\nworld");
+}
+
+#[test]
+fn clean_log_no_false_positives() {
+    // Regular backslashes not followed by n should be preserved
+    let input = "path\\to\\file\n";
+    let output = clean_log_content(input);
+    assert_eq!(output, "path\\to\\file\n");
+}
+
+#[test]
+fn clean_log_empty() {
+    assert_eq!(clean_log_content(""), "");
+}
+
 // ── validate ─────────────────────────────────────────────────────────
 
 #[test]
-fn validate_first_match() {
+fn validate_single_match() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 INFO hello world\n";
-    let output = validate(log, &config);
-    assert!(output.starts_with("Item: log_entry (line 1)"));
-    assert!(output.contains("Raw: 2024-01-01 10:00:00 INFO hello world"));
-    assert!(output.contains("timestamp = \"2024-01-01 10:00:00\""));
-    assert!(output.contains("level = \"INFO\""));
-    assert!(output.contains("message = \"hello world\""));
+    let result = validate(log, &config);
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 1 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
 }
 
 #[test]
-fn validate_no_match() {
+fn validate_no_match_is_error() {
     let config = simple_config();
     let log = "this does not match anything\n";
-    let output = validate(log, &config);
-    assert_eq!(output, "No items matched.");
+    let result = validate(log, &config);
+    assert!(result.error.is_some());
+    assert!(result.output.contains("Processed 0 items"));
+    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    let err = result.error.unwrap();
+    assert!(err.contains("validation error at line 1"));
+    assert!(err.contains("this does not match anything"));
 }
 
 #[test]
-fn validate_multiple_items_shows_first() {
+fn validate_empty_input() {
+    let config = simple_config();
+    let result = validate("", &config);
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 0 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
+}
+
+#[test]
+fn validate_multiple_items_all_pass() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 INFO first\n2024-01-01 10:00:01 WARN second\n";
-    let output = validate(log, &config);
-    assert!(output.contains("Item: log_entry (line 1)"));
-    assert!(output.contains("message = \"first\""));
-    assert!(!output.contains("second"));
+    let result = validate(log, &config);
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 2 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
 }
 
 #[test]
-fn validate_shows_all_atom_values() {
-    let config = simple_config();
-    let log = "2024-01-01 10:00:00 ERROR something broke\n";
-    let output = validate(log, &config);
-    assert!(output.contains("timestamp = \"2024-01-01 10:00:00\""));
-    assert!(output.contains("level = \"ERROR\""));
-    assert!(output.contains("message = \"something broke\""));
-}
-
-#[test]
-fn validate_multiline_raw_indented() {
+fn validate_multiline_item_counted() {
     let atoms = make_atoms();
-    // An item whose regex spans two lines: timestamp + level on line 1, message on line 2
     let parts = vec![
         RawPart { atom: Some("timestamp".into()), regex: None },
         RawPart { atom: None, regex: Some(" ".into()) },
@@ -798,7 +846,41 @@ fn validate_multiline_raw_indented() {
         items: vec![item],
     };
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
-    let output = validate(log, &config);
-    assert!(output.contains("  Raw: 2024-01-01 10:00:00 INFO"));
-    assert!(output.contains("       hello world"));
+    let result = validate(log, &config);
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 1 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
+}
+
+#[test]
+fn validate_stops_at_first_non_matching() {
+    let config = simple_config();
+    let log = "2024-01-01 10:00:00 INFO first\ngarbage line\n2024-01-01 10:00:02 INFO third\n";
+    let result = validate(log, &config);
+    assert!(result.output.contains("Processed 1 items"));
+    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    let err = result.error.unwrap();
+    assert!(err.contains("validation error at line 2"));
+    assert!(err.contains("garbage line"));
+}
+
+#[test]
+fn validate_error_at_first_line() {
+    let config = simple_config();
+    let log = "garbage\n2024-01-01 10:00:00 INFO valid\n";
+    let result = validate(log, &config);
+    assert!(result.output.contains("Processed 0 items"));
+    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    let err = result.error.unwrap();
+    assert!(err.contains("validation error at line 1"));
+}
+
+#[test]
+fn validate_cleans_literal_newlines_in_content() {
+    let config = simple_config();
+    let log = "2024-01-01 10:00:00 INFO hello\\n2024-01-01 10:00:01 WARN world\n";
+    let result = validate(log, &config);
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 2 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
 }
