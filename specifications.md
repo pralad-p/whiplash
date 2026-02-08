@@ -15,7 +15,7 @@ Whiplash compares two log files (“clean” and “dirty”) by parsing them in
 
 ### Top-level sections
 - `general` (optional)
-- `elements` (required, non-empty)
+- `atoms` (required, non-empty)
 - `items` (required, non-empty list)
 
 ### `general`
@@ -23,11 +23,11 @@ Whiplash compares two log files (“clean” and “dirty”) by parsing them in
   - Maximum offset allowed between clean and dirty item indices when matching.
 - `max_failed_items` (int, default `0`, must be >= 0)
   - Maximum number of consecutive failures before stopping. `0` disables early stop.
-- `blacklist_elements` (list of strings, optional)
-  - Element names whose extracted values are excluded from matching signatures for all items.
+- `blacklist_atoms` (list of strings, optional)
+  - Atom names whose extracted values are excluded from matching signatures for all items.
 
-### `elements`
-- A map of element names to regex strings.
+### `atoms`
+- A map of atom names to regex strings.
 - Example key/value shape: `timestamp = "\\d{4}-..."`.
 
 ### `items`
@@ -36,36 +36,30 @@ Each item defines how to match a log entry (possibly multi-line).
 Required:
 - `name` (non-empty string)
 
-Pattern definition is **either**:
-1. `parts` (explicit, ordered list of pattern parts), or
-2. `elements` + optional `joiner` (implicit parts built from elements)
+Pattern definition:
+- `parts` (required, non-empty list of pattern parts)
 
 #### `parts`
 - Non-empty list of tables.
 - Each part must include exactly one of:
-  - `element = "element_name"` (must exist in `elements`)
+  - `atom = "atom_name"` (must reference a name defined in `atoms`)
   - `regex = "..."` (raw regex fragment)
 - `parts` are concatenated in order to form the full regex.
-
-#### `elements` + `joiner`
-- `elements`: non-empty list of element names (must exist in `elements`).
-- `joiner`: regex string used between elements (default `".*?"`).
-- The full pattern becomes: element, joiner, element, joiner, ...
 
 #### Additional item fields
 - `anchored` (bool, default `false`)
   - If true, a match must end on a line boundary (i.e., end of line or end of text).
 - `flags` (string or list of strings, optional)
   - Regex flags by name: `IGNORECASE`, `MULTILINE`, `DOTALL`.
-- `ignore_elements` (list of strings, optional)
-  - Element names whose values are excluded from the item’s signature.
+- `ignore_atoms` (list of strings, optional)
+  - Atom names whose values are excluded from the item's signature.
 
 ## Pattern Compilation
 For each item:
 1. Build a full regex by concatenating `parts` in order.
-2. Element parts become named capture groups with unique names (e.g., `<name__ordinal>`).
+2. Atom parts become named capture groups with unique names (e.g., `<name__ordinal>`).
 3. The regex is compiled with the configured flags.
-4. An item’s effective ignore set is `blacklist_elements ∪ ignore_elements`.
+4. An item's effective ignore set is `blacklist_atoms ∪ ignore_atoms`.
 
 ## Parsing Logs
 - Input logs are read as UTF-8; invalid byte sequences are replaced rather than failing.
@@ -82,9 +76,9 @@ For each matched item:
 - `name`: item name.
 - `line_no`: 1-based line number where the match started.
 - `raw_line`: matched text, with trailing newlines stripped.
-- `element_values`: map of element name to list of captured values.
+- `atom_values`: map of atom name to list of captured values.
 - `signature`: tuple used for comparison:
-  - `(item_name, tuple(values))`, where `values` are captured element values **excluding** ignored elements.
+  - `(item_name, tuple(values))`, where `values` are captured atom values **excluding** ignored atoms.
 
 ## Comparison Algorithm
 Inputs: `clean_items`, `dirty_items`, `threshold`, `max_failed_items`.
@@ -143,7 +137,7 @@ Validation:
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
 - For matching, clean items are authoritative; dirty items are matched to them within the index threshold.
-- Element blacklisting and ignore lists only affect signatures (matching), not parsing.
+- Atom blacklisting and ignore lists only affect signatures (matching), not parsing.
 
 ## Version
 - The implementation should expose a single application version string in one place.
