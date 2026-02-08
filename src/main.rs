@@ -331,12 +331,11 @@ enum CompareEvent {
         clean_idx: usize,
         dirty_idx: usize,
     },
-    Mismatch {
-        clean_idx: usize,
-        reason: String,
-    },
-    DirtyExtra {
+    Extra {
         dirty_idx: usize,
+    },
+    Missing {
+        clean_idx: usize,
     },
 }
 
@@ -352,94 +351,71 @@ fn compare(
     threshold: usize,
     max_failed_items: usize,
 ) -> CompareResult {
-    let mut events = Vec::new();
-    let mut j: usize = 0; // next unmatched dirty index
-    let mut failed_run: usize = 0;
-    let mut stopped = false;
-    let mut stop_reason: Option<String> = None;
-    let mut dirty_matched = vec![false; dirty_items.len()];
+    // Phase 1: find matches — scan dirty left-to-right, find closest unmatched clean
+    let mut clean_matched = vec![false; clean_items.len()];
+    let mut dirty_to_clean: Vec<Option<usize>> = vec![None; dirty_items.len()];
 
-    for (i, clean_item) in clean_items.iter().enumerate() {
-        // Check early stop
-        if max_failed_items > 0 && failed_run >= max_failed_items {
-            stopped = true;
-            stop_reason = Some(format!(
-                "stopped after {} consecutive failures at clean index {}",
-                failed_run, i
-            ));
-            break;
-        }
+    for (di, dirty_item) in dirty_items.iter().enumerate() {
+        let lo = di.saturating_sub(threshold);
+        let hi = (di + threshold).min(clean_items.len().saturating_sub(1));
 
-        let min_k = i.saturating_sub(threshold);
-        let min_k = min_k.max(j);
-        let max_k = (i + threshold).min(dirty_items.len().saturating_sub(1));
-
-        if min_k >= dirty_items.len() || min_k > max_k {
-            events.push(CompareEvent::Mismatch {
-                clean_idx: i,
-                reason: "no candidate within threshold".to_string(),
-            });
-            failed_run += 1;
+        if lo >= clean_items.len() {
             continue;
         }
 
-        // Search within window
-        let mut found = None;
-        for k in min_k..=max_k {
-            if dirty_matched[k] {
+        let mut best: Option<usize> = None;
+        let mut best_dist: usize = usize::MAX;
+        for ci in lo..=hi {
+            if clean_matched[ci] {
                 continue;
             }
-            if clean_item.signature == dirty_items[k].signature {
-                found = Some(k);
-                break;
+            if dirty_item.signature == clean_items[ci].signature {
+                let dist = if di >= ci { di - ci } else { ci - di };
+                if dist < best_dist {
+                    best = Some(ci);
+                    best_dist = dist;
+                }
             }
         }
 
-        match found {
-            Some(k) => {
-                for idx in j..k {
-                    if dirty_matched[idx] {
-                        continue;
-                    }
-                    events.push(CompareEvent::DirtyExtra { dirty_idx: idx });
-                    failed_run += 1;
+        if let Some(ci) = best {
+            clean_matched[ci] = true;
+            dirty_to_clean[di] = Some(ci);
+        }
+    }
 
-                    if max_failed_items > 0 && failed_run >= max_failed_items {
-                        stopped = true;
-                        stop_reason = Some(format!(
-                            "stopped after {} consecutive failures at clean index {}",
-                            failed_run, i
-                        ));
-                        break;
-                    }
-                }
+    // Phase 2: emit events
+    let mut events = Vec::new();
+    let mut failed_run: usize = 0;
+    let mut stopped = false;
+    let mut stop_reason: Option<String> = None;
 
-                if stopped {
-                    break;
-                }
-
-                dirty_matched[k] = true;
-                events.push(CompareEvent::Match {
-                    clean_idx: i,
-                    dirty_idx: k,
-                });
-                j = k + 1;
-                failed_run = 0;
-            }
-            None => {
-                events.push(CompareEvent::Mismatch {
-                    clean_idx: i,
-                    reason: "no match within window".to_string(),
-                });
-                failed_run += 1;
+    for di in 0..dirty_items.len() {
+        if let Some(ci) = dirty_to_clean[di] {
+            events.push(CompareEvent::Match {
+                clean_idx: ci,
+                dirty_idx: di,
+            });
+            failed_run = 0;
+        } else {
+            events.push(CompareEvent::Extra { dirty_idx: di });
+            failed_run += 1;
+            if max_failed_items > 0 && failed_run >= max_failed_items {
+                stopped = true;
+                stop_reason = Some(format!(
+                    "stopped after {} consecutive failures at dirty index {}",
+                    failed_run, di
+                ));
+                break;
             }
         }
     }
 
+    // Append Missing for unmatched clean items (skip if stopped)
     if !stopped {
-        for idx in j..dirty_items.len() {
-            if !dirty_matched[idx] {
-                events.push(CompareEvent::DirtyExtra { dirty_idx: idx });
+        for ci in 0..clean_items.len() {
+            if !clean_matched[ci] {
+                events.push(CompareEvent::Missing { clean_idx: ci });
             }
         }
     }
@@ -459,22 +435,21 @@ fn print_output(result: &CompareResult, clean_items: &[ParsedItem], dirty_items:
             CompareEvent::Match { dirty_idx, .. } => {
                 println!("{}", dirty_items[*dirty_idx].raw_line);
             }
-            CompareEvent::Mismatch { clean_idx, reason } => {
-                let clean = &clean_items[*clean_idx];
-                println!("--- DIVERGENCE ---");
-                println!(
-                    "Expected: [{}] item '{}' (clean line {})",
-                    clean_idx, clean.name, clean.line_no
-                );
-                println!("Reason: {}", reason);
-                return;
-            }
-            CompareEvent::DirtyExtra { dirty_idx } => {
+            CompareEvent::Extra { dirty_idx } => {
                 let dirty = &dirty_items[*dirty_idx];
                 println!("--- DIVERGENCE ---");
                 println!(
                     "Unexpected extra in dirty log: '{}' (dirty line {})",
                     dirty.raw_line, dirty.line_no
+                );
+                return;
+            }
+            CompareEvent::Missing { clean_idx } => {
+                let clean = &clean_items[*clean_idx];
+                println!("--- DIVERGENCE ---");
+                println!(
+                    "Expected item missing from dirty log: '{}' (clean line {})",
+                    clean.raw_line, clean.line_no
                 );
                 return;
             }
