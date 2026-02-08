@@ -27,11 +27,15 @@ struct Cli {
     #[arg(long = "max-failed")]
     max_failed: Option<usize>,
 
+    /// Validate config against a single log file
+    #[arg(long)]
+    validate: bool,
+
     /// Clean (reference) log file
     clean_log: PathBuf,
 
     /// Dirty (test) log file
-    dirty_log: PathBuf,
+    dirty_log: Option<PathBuf>,
 }
 
 // ── Config types (raw TOML deserialization) ──────────────────────────
@@ -485,6 +489,40 @@ fn print_output(result: &CompareResult, clean_items: &[ParsedItem], dirty_items:
     }
 }
 
+// ── Validate ─────────────────────────────────────────────────────────
+
+fn validate(content: &str, config: &Config) -> String {
+    let (items, _) = parse_log(content, config);
+
+    if items.is_empty() {
+        return "No items matched.".to_string();
+    }
+
+    let item = &items[0];
+
+    // Find the compiled item that matched so we can iterate capture_atoms in order
+    let compiled = config.items.iter().find(|c| c.name == item.name).unwrap();
+
+    let mut out = format!("Item: {} (line {})\n", item.name, item.line_no);
+    let mut lines = item.raw_line.lines();
+    if let Some(first) = lines.next() {
+        out.push_str(&format!("  Raw: {}\n", first));
+        for line in lines {
+            out.push_str(&format!("       {}\n", line));
+        }
+    }
+
+    for (atom_name, _) in &compiled.capture_atoms {
+        if let Some(vals) = item.atom_values.get(atom_name) {
+            for val in vals {
+                out.push_str(&format!("  {} = \"{}\"\n", atom_name, val));
+            }
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
 // ── main ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -501,8 +539,20 @@ fn main() -> Result<()> {
     info!(config = %cli.config.display(), "loading configuration");
     let config = load_config(&cli.config, &cli)?;
 
+    if cli.validate {
+        let content = read_file_lossy(&cli.clean_log)?;
+        let output = validate(&content, &config);
+        println!("{}", output);
+        return Ok(());
+    }
+
+    let dirty_log = cli
+        .dirty_log
+        .as_ref()
+        .context("missing required argument: <DIRTY_LOG>")?;
+
     let clean_content = read_file_lossy(&cli.clean_log)?;
-    let dirty_content = read_file_lossy(&cli.dirty_log)?;
+    let dirty_content = read_file_lossy(dirty_log)?;
 
     info!("parsing clean log");
     let (clean_items, clean_unparsed) = parse_log(&clean_content, &config);
