@@ -1,0 +1,26 @@
+# Demonstrates index_threshold: allow matching items that appear
+# up to 3 positions away from their expected index.
+#
+# Useful when the dirty log has a few reordered or inserted lines
+# but the overall sequence is mostly preserved.
+
+[general]
+index_threshold = 3
+
+[atoms]
+timestamp = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+level     = "INFO|WARN|ERROR"
+message   = ".+"
+
+[[items]]
+name = "log_entry"
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "message"

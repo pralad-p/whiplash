@@ -1,0 +1,52 @@
+# Demonstrates per-item ignore_atoms: selectively exclude atoms
+# from the matching signature of specific item types.
+#
+# Here, HTTP request logs ignore the response_time atom (since
+# timing varies between runs), while error logs compare all atoms.
+
+[atoms]
+timestamp     = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+method        = "GET|POST|PUT|DELETE|PATCH"
+path          = "/[^ ]+"
+status        = "\\d{3}"
+response_time = "\\d+ms"
+level         = "ERROR|WARN"
+message       = ".+"
+
+# Matches: 2024-01-15 09:30:00 GET /api/users 200 45ms
+[[items]]
+name = "http_request"
+ignore_atoms = ["timestamp", "response_time"]
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "method"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "path"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "status"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "response_time"
+
+# Matches: 2024-01-15 09:30:00 ERROR Database connection lost
+[[items]]
+name = "error_entry"
+ignore_atoms = ["timestamp"]
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "message"

@@ -1,0 +1,31 @@
+# Demonstrates anchored items: the match must end at a line boundary.
+#
+# Without anchoring, a pattern might greedily consume only part of a
+# line and leave trailing content unmatched.  Anchoring ensures the
+# pattern covers full lines, preventing false positives on partial matches.
+
+[atoms]
+timestamp = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+level     = "INFO|WARN|ERROR"
+key       = "[A-Z_]+"
+value     = "[^ ]+"
+
+# Matches key=value structured logs, anchored to line boundaries
+# e.g.: 2024-01-15 09:30:00 INFO SERVICE_STATUS=healthy
+[[items]]
+name = "structured_entry"
+anchored = true
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "key"
+[[items.parts]]
+regex = "="
+[[items.parts]]
+atom = "value"

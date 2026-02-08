@@ -1,0 +1,27 @@
+# Demonstrates max_failed_items: stop comparison after 5 consecutive
+# failures instead of processing the entire file.
+#
+# Useful for large logs where you only care about finding the first
+# region of divergence.
+
+[general]
+index_threshold  = 2
+max_failed_items = 5
+
+[atoms]
+timestamp = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+level     = "INFO|WARN|ERROR|FATAL"
+message   = ".+"
+
+[[items]]
+name = "log_entry"
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "message"
