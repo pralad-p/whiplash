@@ -56,6 +56,7 @@ struct RawGeneral {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawItem {
     name: String,
     parts: Option<Vec<RawPart>>,
@@ -71,10 +72,13 @@ enum FlagValue {
     List(Vec<String>),
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct RawPart {
     atom: Option<String>,
     regex: Option<String>,
+    #[serde(default)]
+    optional: bool,
 }
 
 // ── Resolved config ──────────────────────────────────────────────────
@@ -172,7 +176,12 @@ fn compile_item(
                 let group_name = format!("{}__{}", atom_name, ord);
                 *ord += 1;
                 capture_atoms.push((atom_name.clone(), group_name.clone()));
-                let fragment = format!("(?P<{}>{})", group_name, atom_regex);
+                let core = format!("(?P<{}>{})", group_name, atom_regex);
+                let fragment = if part.optional {
+                    format!("(?:{})?", core)
+                } else {
+                    core
+                };
                 pattern_str.push_str(&fragment);
                 diagnostic_parts.push(DiagnosticPart {
                     label: atom_name.clone(),
@@ -180,9 +189,14 @@ fn compile_item(
                 });
             }
             (None, Some(regex_frag)) => {
-                pattern_str.push_str(regex_frag);
+                let fragment = if part.optional {
+                    format!("(?:{})?", regex_frag)
+                } else {
+                    regex_frag.clone()
+                };
+                pattern_str.push_str(&fragment);
                 diagnostic_parts.push(DiagnosticPart {
-                    label: format!("(regex)"),
+                    label: "(joining-regex)".to_string(),
                     fragment: regex_frag.clone(),
                 });
             }
@@ -236,7 +250,6 @@ fn compile_item(
 
 #[derive(Debug, Clone)]
 struct ParsedItem {
-    name: String,
     line_no: usize,
     raw_line: String,
     #[allow(dead_code)]
@@ -305,7 +318,6 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
                 let raw_line = matched_text.trim_end_matches(['\n', '\r']).to_string();
 
                 items.push(ParsedItem {
-                    name: compiled.name.clone(),
                     line_no: pos + 1,
                     raw_line,
                     atom_values,
@@ -396,7 +408,7 @@ fn compare(
                 continue;
             }
             if dirty_item.signature == clean_items[ci].signature {
-                let dist = if di >= ci { di - ci } else { ci - di };
+                let dist = di.abs_diff(ci);
                 if dist < best_dist {
                     best = Some(ci);
                     best_dist = dist;
@@ -416,7 +428,7 @@ fn compare(
     let mut stopped = false;
     let mut stop_reason: Option<String> = None;
 
-    for di in 0..dirty_items.len() {
+    for (di, _) in dirty_to_clean.iter().enumerate().take(dirty_items.len()) {
         if let Some(ci) = dirty_to_clean[di] {
             events.push(CompareEvent::Match {
                 clean_idx: ci,
@@ -439,7 +451,7 @@ fn compare(
 
     // Append Missing for unmatched clean items (skip if stopped)
     if !stopped {
-        for ci in 0..clean_items.len() {
+        for (ci, _) in clean_matched.iter().enumerate().take(clean_items.len()) {
             if !clean_matched[ci] {
                 events.push(CompareEvent::Missing { clean_idx: ci });
             }
@@ -509,11 +521,7 @@ fn clean_log_content(content: &str) -> String {
     while i < len {
         if chars[i] == '\\' {
             // Check for literal \r\n (4 chars: \, r, \, n)
-            if i + 3 < len
-                && chars[i + 1] == 'r'
-                && chars[i + 2] == '\\'
-                && chars[i + 3] == 'n'
-            {
+            if i + 3 < len && chars[i + 1] == 'r' && chars[i + 2] == '\\' && chars[i + 3] == 'n' {
                 if i + 4 >= len || chars[i + 4] != '\n' {
                     result.push('\n');
                 }
@@ -609,8 +617,9 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
 
         let dominated = match best_matched_count {
             None => true,
-            Some(best) => matched_count > best
-                || (matched_count == best && total < best_total_parts),
+            Some(best) => {
+                matched_count > best || (matched_count == best && total < best_total_parts)
+            }
         };
         if dominated {
             best_item_name = &item.name;
@@ -618,9 +627,9 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
             best_matched_count = Some(matched_count);
             best_matched_labels = matched_labels;
             best_failed_label = failed_label;
-            best_remaining_count = total.saturating_sub(matched_count).saturating_sub(
-                if best_failed_label.is_some() { 1 } else { 0 },
-            );
+            best_remaining_count = total
+                .saturating_sub(matched_count)
+                .saturating_sub(if best_failed_label.is_some() { 1 } else { 0 });
         }
     }
 
