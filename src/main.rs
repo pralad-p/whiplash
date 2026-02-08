@@ -326,9 +326,7 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
                     }
                 }
 
-                let raw_line = matched_text
-                    .trim_end_matches(|c| c == '\n' || c == '\r')
-                    .to_string();
+                let raw_line = matched_text.trim_end_matches(['\n', '\r']).to_string();
 
                 items.push(ParsedItem {
                     name: compiled.name.clone(),
@@ -422,7 +420,7 @@ fn compare(
             break;
         }
 
-        let min_k = if threshold <= i { i - threshold } else { 0 };
+        let min_k = i.saturating_sub(threshold);
         let min_k = min_k.max(j);
         let max_k = (i + threshold).min(dirty_items.len().saturating_sub(1));
 
@@ -450,19 +448,20 @@ fn compare(
         match found {
             Some(k) => {
                 // Record extras between j and k
-                for e in j..k {
-                    if !dirty_matched[e] {
-                        events.push(CompareEvent::DirtyExtra { dirty_idx: e });
-                        failed_run += 1;
+                for e in dirty_matched.iter().enumerate().take(k).skip(j) {
+                    if dirty_matched[e.0] {
+                        continue;
+                    }
+                    events.push(CompareEvent::DirtyExtra { dirty_idx: e.0 });
+                    failed_run += 1;
 
-                        if max_failed_items > 0 && failed_run >= max_failed_items {
-                            stopped = true;
-                            stop_reason = Some(format!(
-                                "stopped after {} consecutive failures at clean index {}",
-                                failed_run, i
-                            ));
-                            break;
-                        }
+                    if max_failed_items != 0 && failed_run >= max_failed_items {
+                        stopped = true;
+                        stop_reason = Some(format!(
+                            "stopped after {} consecutive failures at clean index {}",
+                            failed_run, i
+                        ));
+                        break;
                     }
                 }
 
@@ -490,9 +489,14 @@ fn compare(
 
     // Remaining dirty items as extras
     if !stopped {
-        for k in j..dirty_items.len() {
-            if !dirty_matched[k] {
-                events.push(CompareEvent::DirtyExtra { dirty_idx: k });
+        for k in dirty_matched
+            .iter()
+            .enumerate()
+            .take(dirty_items.len())
+            .skip(j)
+        {
+            if !dirty_matched[k.0] {
+                events.push(CompareEvent::DirtyExtra { dirty_idx: k.0 });
             }
         }
     }
