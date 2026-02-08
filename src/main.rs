@@ -60,7 +60,6 @@ struct RawGeneral {
 struct RawItem {
     name: String,
     parts: Option<Vec<RawPart>>,
-    anchored: Option<bool>,
     flags: Option<FlagValue>,
     ignore_atoms: Option<Vec<String>>,
 }
@@ -99,7 +98,6 @@ struct DiagnosticPart {
 struct CompiledItem {
     name: String,
     pattern: Regex,
-    anchored: bool,
     /// Atom names that participate in this item's captures (in order).
     capture_atoms: Vec<(String, String)>, // (atom_name, capture_group_name)
     /// Atoms to ignore in signature.
@@ -238,7 +236,6 @@ fn compile_item(
     Ok(CompiledItem {
         name: raw.name.clone(),
         pattern,
-        anchored: raw.anchored.unwrap_or(false),
         capture_atoms,
         ignore_set,
         diagnostic_parts,
@@ -274,23 +271,6 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
                 // Match must start at the beginning of the remaining text
                 if m.start() != 0 {
                     continue;
-                }
-
-                // Check anchor: match must end at a line boundary
-                if compiled.anchored {
-                    let match_end = m.end();
-                    let remaining_bytes = remaining.as_bytes();
-                    if match_end < remaining_bytes.len() {
-                        // Must end at newline
-                        let prev_byte = if match_end > 0 {
-                            remaining_bytes[match_end - 1]
-                        } else {
-                            0
-                        };
-                        if prev_byte != b'\n' && prev_byte != b'\r' {
-                            continue;
-                        }
-                    }
                 }
 
                 // Extract captures
@@ -702,20 +682,6 @@ fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult>
                 if let Some(m) = compiled.pattern.find(&buf) {
                     if m.start() != 0 {
                         continue;
-                    }
-                    if compiled.anchored {
-                        let match_end = m.end();
-                        let buf_bytes = buf.as_bytes();
-                        if match_end < buf_bytes.len() {
-                            let prev = if match_end > 0 {
-                                buf_bytes[match_end - 1]
-                            } else {
-                                0
-                            };
-                            if prev != b'\n' && prev != b'\r' {
-                                continue;
-                            }
-                        }
                     }
 
                     let span = m.as_str().lines().count().max(1);
