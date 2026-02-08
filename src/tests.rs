@@ -52,8 +52,15 @@ fn simple_config() -> Config {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec![],
+        delimiters: vec![], // legacy mode
         items: vec![item],
     }
+}
+
+fn simple_delimited_config(delim_pat: &str) -> Config {
+    let mut cfg = simple_config();
+    cfg.delimiters = vec![Regex::new(delim_pat).unwrap()];
+    cfg
 }
 
 fn make_parsed_item(name: &str, line_no: usize, raw_line: &str, sig_vals: Vec<&str>) -> ParsedItem {
@@ -107,6 +114,55 @@ fn split_lines_multiple() {
 #[test]
 fn split_lines_trailing_no_newline() {
     assert_eq!(split_lines_keepends("a\nb\nc"), vec!["a\n", "b\n", "c"]);
+}
+
+// ── Delimiters (general.delimiters + compile_delimiters) ────────────
+
+#[test]
+fn compile_delimiters_none_is_empty() {
+    let general = RawGeneral::default();
+    let delims = compile_delimiters(&general).unwrap();
+    assert!(delims.is_empty());
+}
+
+#[test]
+fn compile_delimiters_single() {
+    let general: RawGeneral = RawGeneral {
+        delimiters: Some(DelimiterValue::Single(r"^---$".into())),
+        ..Default::default()
+    };
+    let delims = compile_delimiters(&general).unwrap();
+    assert_eq!(delims.len(), 1);
+    assert!(delims[0].is_match("---"));
+    assert!(!delims[0].is_match("----"));
+}
+
+#[test]
+fn compile_delimiters_list() {
+    let general = RawGeneral {
+        delimiters: Some(DelimiterValue::List(vec![r"^---$".into(), r"^===$".into()])),
+        ..Default::default()
+    };
+    let delims = compile_delimiters(&general).unwrap();
+    assert_eq!(delims.len(), 2);
+    assert!(delims[0].is_match("---"));
+    assert!(delims[1].is_match("==="));
+}
+
+#[test]
+fn compile_delimiters_invalid_regex_rejected() {
+    let general = RawGeneral {
+        delimiters: Some(DelimiterValue::Single(r"(".into())),
+        ..Default::default()
+    };
+    assert!(compile_delimiters(&general).is_err());
+}
+
+#[test]
+fn is_delimiter_line_matches_any_delimiter() {
+    let cfg = simple_delimited_config(r"^---$");
+    assert!(is_delimiter_line("---", &cfg));
+    assert!(!is_delimiter_line(" --- ", &cfg)); // regex is anchored + exact
 }
 
 // ── compile_item ─────────────────────────────────────────────────────
@@ -319,6 +375,50 @@ atom = "level"
 }
 
 #[test]
+fn config_toml_with_general_delimiters_single() {
+    let toml_str = r#"
+[general]
+delimiters = "^---$"
+
+[atoms]
+level = "INFO"
+
+[[items]]
+name = "entry"
+[[items.parts]]
+atom = "level"
+"#;
+    let raw: RawConfig = toml::from_str(toml_str).unwrap();
+    let general = raw.general.unwrap();
+    match general.delimiters.unwrap() {
+        DelimiterValue::Single(s) => assert_eq!(s, "^---$"),
+        _ => panic!("expected single delimiter"),
+    }
+}
+
+#[test]
+fn config_toml_with_general_delimiters_list() {
+    let toml_str = r#"
+[general]
+delimiters = ["^---$", "^===$"]
+
+[atoms]
+level = "INFO"
+
+[[items]]
+name = "entry"
+[[items.parts]]
+atom = "level"
+"#;
+    let raw: RawConfig = toml::from_str(toml_str).unwrap();
+    let general = raw.general.unwrap();
+    match general.delimiters.unwrap() {
+        DelimiterValue::List(v) => assert_eq!(v, vec!["^---$", "^===$"]),
+        _ => panic!("expected list delimiters"),
+    }
+}
+
+#[test]
 fn config_toml_with_parts_atom_and_regex() {
     let toml_str = r#"
 [atoms]
@@ -339,7 +439,7 @@ regex = ": "
     assert_eq!(parts[1].regex.as_deref(), Some(": "));
 }
 
-// ── parse_log ────────────────────────────────────────────────────────
+// ── parse_log (legacy + delimiter mode) ──────────────────────────────
 
 #[test]
 fn parse_log_empty_content() {
@@ -400,6 +500,7 @@ fn parse_log_signature_excludes_ignored_atoms() {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec![],
+        delimiters: vec![],
         items: vec![item],
     };
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
@@ -424,6 +525,39 @@ fn parse_log_no_trailing_newline() {
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello", &config);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].raw_line, "2024-01-01 10:00:00 INFO hello");
+}
+
+#[test]
+fn parse_log_with_delimiters_splits_blocks() {
+    let config = simple_delimited_config(r"^---$");
+    let content = concat!(
+        "2024-01-01 10:00:00 INFO a\n",
+        "---\n",
+        "2024-01-01 10:00:01 WARN b\n",
+        "---\n"
+    );
+    let (items, unparsed) = parse_log(content, &config);
+    assert_eq!(items.len(), 2);
+    assert!(unparsed.is_empty());
+    assert_eq!(items[0].line_no, 1);
+    assert_eq!(items[1].line_no, 3);
+}
+
+#[test]
+fn parse_log_with_delimiters_unparsed_block_records_start_line() {
+    let config = simple_delimited_config(r"^---$");
+    let content = concat!(
+        "2024-01-01 10:00:00 INFO ok\n",
+        "---\n",
+        "this block does not match\n",
+        "still not matching\n",
+        "---\n",
+        "2024-01-01 10:00:01 WARN ok2\n"
+    );
+    let (items, unparsed_blocks) = parse_log(content, &config);
+    assert_eq!(items.len(), 2);
+    // bad block starts at line 3
+    assert_eq!(unparsed_blocks, vec![3]);
 }
 
 // ── compare ──────────────────────────────────────────────────────────
@@ -669,6 +803,7 @@ fn integration_blacklist_ignores_timestamp() {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec!["timestamp".into()],
+        delimiters: vec![],
         items: vec![item],
     };
     let clean_log = "2024-01-01 10:00:00 INFO hello\n";
@@ -753,7 +888,7 @@ fn clean_log_empty() {
     assert_eq!(clean_log_content(""), "");
 }
 
-// ── validate ─────────────────────────────────────────────────────────
+// ── validate (legacy + delimiter mode) ───────────────────────────────
 
 #[test]
 fn validate_single_match() {
@@ -835,6 +970,7 @@ fn validate_multiline_item_counted() {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec![],
+        delimiters: vec![],
         items: vec![item],
     };
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
@@ -881,6 +1017,50 @@ fn validate_cleans_literal_newlines_in_content() {
     assert!(result.output.contains("Config.toml correct 🟢"));
 }
 
+#[test]
+fn validate_with_delimiters_success() {
+    let config = simple_delimited_config(r"^---$");
+    let log = concat!(
+        "2024-01-01 10:00:00 INFO a\n",
+        "---\n",
+        "2024-01-01 10:00:01 WARN b\n"
+    );
+    let result = validate(log.as_bytes(), &config).unwrap();
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 2 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
+}
+
+#[test]
+fn validate_with_delimiters_error_reports_block_start_line() {
+    let config = simple_delimited_config(r"^---$");
+    let log = concat!(
+        "2024-01-01 10:00:00 INFO a\n",
+        "---\n",
+        "not matching\n",
+        "still not matching\n",
+        "---\n"
+    );
+    let result = validate(log.as_bytes(), &config).unwrap();
+    assert!(result.error.is_some());
+    // bad block starts at line 3
+    let err = result.error.unwrap();
+    assert!(err.contains("validation error at line 3"));
+    assert!(result.output.contains("Best match: item 'log_entry'"));
+    assert!(result
+        .output
+        .contains("Validation failed, issue with Config.toml 🔴"));
+}
+
+#[test]
+fn validate_with_delimiters_delimiter_at_start_sets_block_line_numbers() {
+    let config = simple_delimited_config(r"^---$");
+    let log = concat!("---\n", "2024-01-01 10:00:00 INFO a\n", "---\n");
+    let result = validate(log.as_bytes(), &config).unwrap();
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 1 items"));
+}
+
 // ── max_pattern_line_span ────────────────────────────────────────────
 
 #[test]
@@ -915,6 +1095,7 @@ fn max_span_multiline_pattern() {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec![],
+        delimiters: vec![],
         items: vec![item],
     };
     assert_eq!(max_pattern_line_span(&config), 2);
@@ -965,6 +1146,7 @@ fn diagnose_best_match_selection_multiple_items() {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec![],
+        delimiters: vec![],
         items: vec![item1, item2],
     };
 
@@ -989,6 +1171,7 @@ fn diagnose_with_flags_ignorecase() {
         index_threshold: 0,
         max_failed_items: 0,
         blacklist_atoms: vec![],
+        delimiters: vec![],
         items: vec![item],
     };
 
