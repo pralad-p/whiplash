@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/whiplash/config.schema.json",
+  "title": "Whiplash Configuration",
+  "description": "Schema for the TOML configuration file passed to whiplash via --config.",
+  "type": "object",
+  "required": ["atoms", "items"],
+  "additionalProperties": false,
+  "properties": {
+    "general": {
+      "description": "Global settings for comparison behavior.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index_threshold": {
+          "description": "Maximum offset allowed between clean and dirty item indices when matching.",
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "max_failed_items": {
+          "description": "Maximum number of consecutive failures before stopping. 0 disables early stop.",
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "blacklist_atoms": {
+          "description": "Atom names whose extracted values are excluded from matching signatures for all items.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "atoms": {
+      "description": "Map of atom names to regex patterns. Atoms are reusable named patterns referenced by item parts.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" }
+    },
+    "items": {
+      "description": "Ordered list of item definitions. Each item defines how to match a log entry.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "parts"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Unique name identifying this item type.",
+            "type": "string",
+            "minLength": 1
+          },
+          "parts": {
+            "description": "Ordered list of pattern parts concatenated to form the full regex.",
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "oneOf": [
+                { "required": ["atom"] },
+                { "required": ["regex"] }
+              ],
+              "properties": {
+                "atom": {
+                  "description": "Reference to a named atom defined in the atoms section.",
+                  "type": "string"
+                },
+                "regex": {
+                  "description": "Raw regex fragment.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "anchored": {
+            "description": "If true, a match must end on a line boundary.",
+            "type": "boolean",
+            "default": false
+          },
+          "flags": {
+            "description": "Regex flags: IGNORECASE, MULTILINE, DOTALL.",
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            ]
+          },
+          "ignore_atoms": {
+            "description": "Atom names whose values are excluded from this item's matching signature.",
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
