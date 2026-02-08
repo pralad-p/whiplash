@@ -138,55 +138,41 @@ fn compile_item(
         bail!("item name must be non-empty");
     }
 
-    let has_parts = raw.parts.is_some();
-    if !has_parts {
-        bail!(
-            "item '{}': must specify `parts`",
-            raw.name
-        );
+    let parts = raw.parts.as_deref().unwrap_or_default();
+    if parts.is_empty() {
+        bail!("item '{}': `parts` must be non-empty", raw.name);
     }
 
     let mut pattern_str = String::new();
     let mut capture_atoms: Vec<(String, String)> = Vec::new();
     let mut ordinal_counter: HashMap<String, usize> = HashMap::new();
 
-    if let Some(parts) = &raw.parts {
-        if parts.is_empty() {
-            bail!("item '{}': `parts` must be non-empty", raw.name);
-        }
-        for part in parts {
-            match (&part.atom, &part.regex) {
-                (Some(atom_name), None) => {
-                    let atom_regex = atoms
-                        .get(atom_name)
-                        .with_context(|| format!("atom '{}' not found", atom_name))?;
-                    let ord = ordinal_counter.entry(atom_name.clone()).or_insert(0);
-                    let group_name = format!("{}__{}", atom_name, ord);
-                    *ord += 1;
-                    capture_atoms.push((atom_name.clone(), group_name.clone()));
-                    pattern_str.push_str(&format!("(?P<{}>{})", group_name, atom_regex));
-                }
-                (None, Some(regex_frag)) => {
-                    pattern_str.push_str(regex_frag);
-                }
-                (Some(_), Some(_)) => {
-                    bail!("part must have exactly one of `atom` or `regex`");
-                }
-                (None, None) => {
-                    bail!("part must have exactly one of `atom` or `regex`");
-                }
+    for part in parts {
+        match (&part.atom, &part.regex) {
+            (Some(atom_name), None) => {
+                let atom_regex = atoms
+                    .get(atom_name)
+                    .with_context(|| format!("atom '{}' not found", atom_name))?;
+                let ord = ordinal_counter.entry(atom_name.clone()).or_insert(0);
+                let group_name = format!("{}__{}", atom_name, ord);
+                *ord += 1;
+                capture_atoms.push((atom_name.clone(), group_name.clone()));
+                pattern_str.push_str(&format!("(?P<{}>{})", group_name, atom_regex));
             }
+            (None, Some(regex_frag)) => {
+                pattern_str.push_str(regex_frag);
+            }
+            _ => bail!("part must have exactly one of `atom` or `regex`"),
         }
     }
 
-    // Apply flags
-    let flags = match &raw.flags {
-        Some(FlagValue::Single(s)) => vec![s.clone()],
-        Some(FlagValue::List(v)) => v.clone(),
-        None => vec![],
+    let flags: &[String] = match &raw.flags {
+        Some(FlagValue::Single(s)) => std::slice::from_ref(s),
+        Some(FlagValue::List(v)) => v,
+        None => &[],
     };
     let mut flag_str = String::new();
-    for flag in &flags {
+    for flag in flags {
         match flag.as_str() {
             "IGNORECASE" => flag_str.push('i'),
             "MULTILINE" => flag_str.push('m'),
@@ -195,28 +181,22 @@ fn compile_item(
         }
     }
 
-    let full_pattern = if flag_str.is_empty() {
-        pattern_str
-    } else {
-        format!("(?{}){}", flag_str, pattern_str)
-    };
+    if !flag_str.is_empty() {
+        pattern_str = format!("(?{}){}", flag_str, pattern_str);
+    }
 
-    debug!(item = %raw.name, pattern = %full_pattern, "compiled pattern");
+    debug!(item = %raw.name, pattern = %pattern_str, "compiled pattern");
 
-    let pattern = Regex::new(&full_pattern)
+    let pattern = Regex::new(&pattern_str)
         .with_context(|| format!("invalid regex for item '{}'", raw.name))?;
 
-    let anchored = raw.anchored.unwrap_or(false);
-
-    let mut ignore_set: Vec<String> = blacklist.to_vec();
-    if let Some(ignore) = &raw.ignore_atoms {
-        ignore_set.extend(ignore.iter().cloned());
-    }
+    let mut ignore_set = blacklist.to_vec();
+    ignore_set.extend(raw.ignore_atoms.iter().flatten().cloned());
 
     Ok(CompiledItem {
         name: raw.name.clone(),
         pattern,
-        anchored,
+        anchored: raw.anchored.unwrap_or(false),
         capture_atoms,
         ignore_set,
     })
@@ -277,25 +257,18 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
                 // Count how many lines the match spans
                 let lines_spanned = matched_text.lines().count().max(1);
 
-                // Build atom_values
                 let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
+                let mut sig_values = Vec::new();
                 for (atom_name, group_name) in &compiled.capture_atoms {
                     if let Some(val) = caps.name(group_name) {
+                        let val_str = val.as_str().to_string();
                         atom_values
                             .entry(atom_name.clone())
                             .or_default()
-                            .push(val.as_str().to_string());
-                    }
-                }
-
-                // Build signature: (name, values excluding ignored atoms)
-                let mut sig_values = Vec::new();
-                for (atom_name, group_name) in &compiled.capture_atoms {
-                    if compiled.ignore_set.contains(atom_name) {
-                        continue;
-                    }
-                    if let Some(val) = caps.name(group_name) {
-                        sig_values.push(val.as_str().to_string());
+                            .push(val_str.clone());
+                        if !compiled.ignore_set.contains(atom_name) {
+                            sig_values.push(val_str);
+                        }
                     }
                 }
 
@@ -420,15 +393,14 @@ fn compare(
 
         match found {
             Some(k) => {
-                // Record extras between j and k
-                for e in dirty_matched.iter().enumerate().take(k).skip(j) {
-                    if dirty_matched[e.0] {
+                for idx in j..k {
+                    if dirty_matched[idx] {
                         continue;
                     }
-                    events.push(CompareEvent::DirtyExtra { dirty_idx: e.0 });
+                    events.push(CompareEvent::DirtyExtra { dirty_idx: idx });
                     failed_run += 1;
 
-                    if max_failed_items != 0 && failed_run >= max_failed_items {
+                    if max_failed_items > 0 && failed_run >= max_failed_items {
                         stopped = true;
                         stop_reason = Some(format!(
                             "stopped after {} consecutive failures at clean index {}",
@@ -460,16 +432,10 @@ fn compare(
         }
     }
 
-    // Remaining dirty items as extras
     if !stopped {
-        for k in dirty_matched
-            .iter()
-            .enumerate()
-            .take(dirty_items.len())
-            .skip(j)
-        {
-            if !dirty_matched[k.0] {
-                events.push(CompareEvent::DirtyExtra { dirty_idx: k.0 });
+        for idx in j..dirty_items.len() {
+            if !dirty_matched[idx] {
+                events.push(CompareEvent::DirtyExtra { dirty_idx: idx });
             }
         }
     }
