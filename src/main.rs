@@ -39,7 +39,7 @@ struct Cli {
 #[derive(Deserialize)]
 struct RawConfig {
     general: Option<RawGeneral>,
-    elements: HashMap<String, String>,
+    atoms: HashMap<String, String>,
     items: Vec<RawItem>,
 }
 
@@ -47,18 +47,16 @@ struct RawConfig {
 struct RawGeneral {
     index_threshold: Option<usize>,
     max_failed_items: Option<usize>,
-    blacklist_elements: Option<Vec<String>>,
+    blacklist_atoms: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct RawItem {
     name: String,
     parts: Option<Vec<RawPart>>,
-    elements: Option<Vec<String>>,
-    joiner: Option<String>,
     anchored: Option<bool>,
     flags: Option<FlagValue>,
-    ignore_elements: Option<Vec<String>>,
+    ignore_atoms: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -68,9 +66,9 @@ enum FlagValue {
     List(Vec<String>),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct RawPart {
-    element: Option<String>,
+    atom: Option<String>,
     regex: Option<String>,
 }
 
@@ -80,7 +78,7 @@ struct Config {
     index_threshold: usize,
     max_failed_items: usize,
     #[allow(dead_code)]
-    blacklist_elements: Vec<String>,
+    blacklist_atoms: Vec<String>,
     items: Vec<CompiledItem>,
 }
 
@@ -88,9 +86,9 @@ struct CompiledItem {
     name: String,
     pattern: Regex,
     anchored: bool,
-    /// Element names that participate in this item's captures (in order).
-    capture_elements: Vec<(String, String)>, // (element_name, capture_group_name)
-    /// Elements to ignore in signature.
+    /// Atom names that participate in this item's captures (in order).
+    capture_atoms: Vec<(String, String)>, // (atom_name, capture_group_name)
+    /// Atoms to ignore in signature.
     ignore_set: Vec<String>,
 }
 
@@ -100,8 +98,8 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     let text = fs::read_to_string(path).context("failed to read config file")?;
     let raw: RawConfig = toml::from_str(&text).context("failed to parse config TOML")?;
 
-    if raw.elements.is_empty() {
-        bail!("config: `elements` must be non-empty");
+    if raw.atoms.is_empty() {
+        bail!("config: `atoms` must be non-empty");
     }
     if raw.items.is_empty() {
         bail!("config: `items` must be non-empty");
@@ -114,11 +112,11 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     let max_failed_items = cli
         .max_failed
         .unwrap_or(general.max_failed_items.unwrap_or(0));
-    let blacklist_elements = general.blacklist_elements.unwrap_or_default();
+    let blacklist_atoms = general.blacklist_atoms.unwrap_or_default();
 
     let mut compiled_items = Vec::new();
     for raw_item in &raw.items {
-        let item = compile_item(raw_item, &raw.elements, &blacklist_elements)
+        let item = compile_item(raw_item, &raw.atoms, &blacklist_atoms)
             .with_context(|| format!("compiling item '{}'", raw_item.name))?;
         compiled_items.push(item);
     }
@@ -126,14 +124,14 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     Ok(Config {
         index_threshold,
         max_failed_items,
-        blacklist_elements,
+        blacklist_atoms,
         items: compiled_items,
     })
 }
 
 fn compile_item(
     raw: &RawItem,
-    elements: &HashMap<String, String>,
+    atoms: &HashMap<String, String>,
     blacklist: &[String],
 ) -> Result<CompiledItem> {
     if raw.name.is_empty() {
@@ -141,22 +139,15 @@ fn compile_item(
     }
 
     let has_parts = raw.parts.is_some();
-    let has_elements = raw.elements.is_some();
-    if has_parts && has_elements {
+    if !has_parts {
         bail!(
-            "item '{}': cannot specify both `parts` and `elements`",
-            raw.name
-        );
-    }
-    if !has_parts && !has_elements {
-        bail!(
-            "item '{}': must specify either `parts` or `elements`",
+            "item '{}': must specify `parts`",
             raw.name
         );
     }
 
     let mut pattern_str = String::new();
-    let mut capture_elements: Vec<(String, String)> = Vec::new();
+    let mut capture_atoms: Vec<(String, String)> = Vec::new();
     let mut ordinal_counter: HashMap<String, usize> = HashMap::new();
 
     if let Some(parts) = &raw.parts {
@@ -164,45 +155,27 @@ fn compile_item(
             bail!("item '{}': `parts` must be non-empty", raw.name);
         }
         for part in parts {
-            match (&part.element, &part.regex) {
-                (Some(elem_name), None) => {
-                    let elem_regex = elements
-                        .get(elem_name)
-                        .with_context(|| format!("element '{}' not found", elem_name))?;
-                    let ord = ordinal_counter.entry(elem_name.clone()).or_insert(0);
-                    let group_name = format!("{}__{}", elem_name, ord);
+            match (&part.atom, &part.regex) {
+                (Some(atom_name), None) => {
+                    let atom_regex = atoms
+                        .get(atom_name)
+                        .with_context(|| format!("atom '{}' not found", atom_name))?;
+                    let ord = ordinal_counter.entry(atom_name.clone()).or_insert(0);
+                    let group_name = format!("{}__{}", atom_name, ord);
                     *ord += 1;
-                    capture_elements.push((elem_name.clone(), group_name.clone()));
-                    pattern_str.push_str(&format!("(?P<{}>{})", group_name, elem_regex));
+                    capture_atoms.push((atom_name.clone(), group_name.clone()));
+                    pattern_str.push_str(&format!("(?P<{}>{})", group_name, atom_regex));
                 }
                 (None, Some(regex_frag)) => {
                     pattern_str.push_str(regex_frag);
                 }
                 (Some(_), Some(_)) => {
-                    bail!("part must have exactly one of `element` or `regex`");
+                    bail!("part must have exactly one of `atom` or `regex`");
                 }
                 (None, None) => {
-                    bail!("part must have exactly one of `element` or `regex`");
+                    bail!("part must have exactly one of `atom` or `regex`");
                 }
             }
-        }
-    } else if let Some(elem_names) = &raw.elements {
-        if elem_names.is_empty() {
-            bail!("item '{}': `elements` must be non-empty", raw.name);
-        }
-        let joiner = raw.joiner.as_deref().unwrap_or(".*?");
-        for (i, elem_name) in elem_names.iter().enumerate() {
-            if i > 0 {
-                pattern_str.push_str(joiner);
-            }
-            let elem_regex = elements
-                .get(elem_name)
-                .with_context(|| format!("element '{}' not found", elem_name))?;
-            let ord = ordinal_counter.entry(elem_name.clone()).or_insert(0);
-            let group_name = format!("{}__{}", elem_name, ord);
-            *ord += 1;
-            capture_elements.push((elem_name.clone(), group_name.clone()));
-            pattern_str.push_str(&format!("(?P<{}>{})", group_name, elem_regex));
         }
     }
 
@@ -236,7 +209,7 @@ fn compile_item(
     let anchored = raw.anchored.unwrap_or(false);
 
     let mut ignore_set: Vec<String> = blacklist.to_vec();
-    if let Some(ignore) = &raw.ignore_elements {
+    if let Some(ignore) = &raw.ignore_atoms {
         ignore_set.extend(ignore.iter().cloned());
     }
 
@@ -244,7 +217,7 @@ fn compile_item(
         name: raw.name.clone(),
         pattern,
         anchored,
-        capture_elements,
+        capture_atoms,
         ignore_set,
     })
 }
@@ -257,7 +230,7 @@ struct ParsedItem {
     line_no: usize,
     raw_line: String,
     #[allow(dead_code)]
-    element_values: HashMap<String, Vec<String>>,
+    atom_values: HashMap<String, Vec<String>>,
     signature: (String, Vec<String>),
 }
 
@@ -302,23 +275,23 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
                 let matched_text = m.as_str();
 
                 // Count how many lines the match spans
-                let lines_spanned = matched_text.matches('\n').count().max(1);
+                let lines_spanned = matched_text.lines().count().max(1);
 
-                // Build element_values
-                let mut element_values: HashMap<String, Vec<String>> = HashMap::new();
-                for (elem_name, group_name) in &compiled.capture_elements {
+                // Build atom_values
+                let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
+                for (atom_name, group_name) in &compiled.capture_atoms {
                     if let Some(val) = caps.name(group_name) {
-                        element_values
-                            .entry(elem_name.clone())
+                        atom_values
+                            .entry(atom_name.clone())
                             .or_default()
                             .push(val.as_str().to_string());
                     }
                 }
 
-                // Build signature: (name, values excluding ignored elements)
+                // Build signature: (name, values excluding ignored atoms)
                 let mut sig_values = Vec::new();
-                for (elem_name, group_name) in &compiled.capture_elements {
-                    if compiled.ignore_set.contains(elem_name) {
+                for (atom_name, group_name) in &compiled.capture_atoms {
+                    if compiled.ignore_set.contains(atom_name) {
                         continue;
                     }
                     if let Some(val) = caps.name(group_name) {
@@ -332,7 +305,7 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
                     name: compiled.name.clone(),
                     line_no: pos + 1,
                     raw_line,
-                    element_values,
+                    atom_values,
                     signature: (compiled.name.clone(), sig_values),
                 });
 
