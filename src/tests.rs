@@ -32,11 +32,13 @@ fn atom_parts(atom_names: &[&str], joiner: Option<&str>) -> Vec<RawPart> {
             parts.push(RawPart {
                 atom: None,
                 regex: Some(joiner.into()),
+                ..Default::default()
             });
         }
         parts.push(RawPart {
             atom: Some((*name).into()),
             regex: None,
+            ..Default::default()
         });
     }
     parts
@@ -55,14 +57,8 @@ fn simple_config() -> Config {
     }
 }
 
-fn make_parsed_item(
-    name: &str,
-    line_no: usize,
-    raw_line: &str,
-    sig_vals: Vec<&str>,
-) -> ParsedItem {
+fn make_parsed_item(name: &str, line_no: usize, raw_line: &str, sig_vals: Vec<&str>) -> ParsedItem {
     ParsedItem {
-        name: name.into(),
         line_no,
         raw_line: raw_line.into(),
         atom_values: HashMap::new(),
@@ -123,14 +119,17 @@ fn compile_item_with_parts_atom_and_regex() {
         RawPart {
             atom: Some("level".into()),
             regex: None,
+            ..Default::default()
         },
         RawPart {
             atom: None,
             regex: Some(": ".into()),
+            ..Default::default()
         },
         RawPart {
             atom: Some("message".into()),
             regex: None,
+            ..Default::default()
         },
     ];
     let raw = raw_item_with_parts("entry", parts);
@@ -188,6 +187,7 @@ fn compile_item_unknown_atom_in_part_rejected() {
     let parts = vec![RawPart {
         atom: Some("nonexistent".into()),
         regex: None,
+        ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
     assert!(compile_item(&raw, &atoms, &[]).is_err());
@@ -206,6 +206,7 @@ fn compile_item_part_with_both_atom_and_regex_rejected() {
     let parts = vec![RawPart {
         atom: Some("level".into()),
         regex: Some("x".into()),
+        ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
     assert!(compile_item(&raw, &atoms, &[]).is_err());
@@ -217,6 +218,7 @@ fn compile_item_part_with_neither_rejected() {
     let parts = vec![RawPart {
         atom: None,
         regex: None,
+        ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
     assert!(compile_item(&raw, &atoms, &[]).is_err());
@@ -365,7 +367,6 @@ fn parse_log_single_matching_line() {
     let config = simple_config();
     let (items, unparsed) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].name, "log_entry");
     assert_eq!(items[0].line_no, 1);
     assert_eq!(items[0].raw_line, "2024-01-01 10:00:00 INFO hello");
     assert!(unparsed.is_empty());
@@ -428,24 +429,6 @@ fn parse_log_atom_values_populated() {
         items[0].atom_values.get("level").unwrap(),
         &vec!["ERROR".to_string()]
     );
-}
-
-#[test]
-fn parse_log_first_pattern_wins() {
-    let atoms = make_atoms();
-    let parts = atom_parts(&["level", "message"], Some(" "));
-    let raw1 = raw_item_with_parts("first", parts.clone());
-    let raw2 = raw_item_with_parts("second", parts);
-    let item1 = compile_item(&raw1, &atoms, &[]).unwrap();
-    let item2 = compile_item(&raw2, &atoms, &[]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        blacklist_atoms: vec![],
-        items: vec![item1, item2],
-    };
-    let (items, _) = parse_log("INFO hello\n", &config);
-    assert_eq!(items[0].name, "first");
 }
 
 #[test]
@@ -802,7 +785,9 @@ fn validate_no_match_is_error() {
     let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_some());
     assert!(result.output.contains("Processed 0 items"));
-    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    assert!(result
+        .output
+        .contains("Validation failed, issue with Config.toml 🔴"));
     let err = result.error.unwrap();
     assert!(err.contains("validation error at line 1"));
     assert!(err.contains("this does not match anything"));
@@ -831,11 +816,31 @@ fn validate_multiple_items_all_pass() {
 fn validate_multiline_item_counted() {
     let atoms = make_atoms();
     let parts = vec![
-        RawPart { atom: Some("timestamp".into()), regex: None },
-        RawPart { atom: None, regex: Some(" ".into()) },
-        RawPart { atom: Some("level".into()), regex: None },
-        RawPart { atom: None, regex: Some(r"\n".into()) },
-        RawPart { atom: Some("message".into()), regex: None },
+        RawPart {
+            atom: Some("timestamp".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(" ".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("level".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(r"\n".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("message".into()),
+            regex: None,
+            ..Default::default()
+        },
     ];
     let raw = raw_item_with_parts("multiline_entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
@@ -858,7 +863,9 @@ fn validate_stops_at_first_non_matching() {
     let log = "2024-01-01 10:00:00 INFO first\ngarbage line\n2024-01-01 10:00:02 INFO third\n";
     let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.output.contains("Processed 1 items"));
-    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    assert!(result
+        .output
+        .contains("Validation failed, issue with Config.toml 🔴"));
     let err = result.error.unwrap();
     assert!(err.contains("validation error at line 2"));
     assert!(err.contains("garbage line"));
@@ -870,7 +877,9 @@ fn validate_error_at_first_line() {
     let log = "garbage\n2024-01-01 10:00:00 INFO valid\n";
     let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.output.contains("Processed 0 items"));
-    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    assert!(result
+        .output
+        .contains("Validation failed, issue with Config.toml 🔴"));
     let err = result.error.unwrap();
     assert!(err.contains("validation error at line 1"));
 }
@@ -897,9 +906,21 @@ fn max_span_single_line_patterns() {
 fn max_span_multiline_pattern() {
     let atoms = make_atoms();
     let parts = vec![
-        RawPart { atom: Some("level".into()), regex: None },
-        RawPart { atom: None, regex: Some(r"\n".into()) },
-        RawPart { atom: Some("message".into()), regex: None },
+        RawPart {
+            atom: Some("level".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(r"\n".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("message".into()),
+            regex: None,
+            ..Default::default()
+        },
     ];
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
@@ -1000,5 +1021,7 @@ fn validate_diagnostic_in_error_output() {
     assert!(result.output.contains("Best match: item 'log_entry'"));
     assert!(result.output.contains("[matched]"));
     assert!(result.output.contains("[no match]"));
-    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+    assert!(result
+        .output
+        .contains("Validation failed, issue with Config.toml 🔴"));
 }
