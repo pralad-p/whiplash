@@ -789,7 +789,7 @@ fn clean_log_empty() {
 fn validate_single_match() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 INFO hello world\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
     assert!(result.output.contains("Processed 1 items"));
     assert!(result.output.contains("Config.toml correct 🟢"));
@@ -799,7 +799,7 @@ fn validate_single_match() {
 fn validate_no_match_is_error() {
     let config = simple_config();
     let log = "this does not match anything\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_some());
     assert!(result.output.contains("Processed 0 items"));
     assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
@@ -811,7 +811,7 @@ fn validate_no_match_is_error() {
 #[test]
 fn validate_empty_input() {
     let config = simple_config();
-    let result = validate("", &config);
+    let result = validate("".as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
     assert!(result.output.contains("Processed 0 items"));
     assert!(result.output.contains("Config.toml correct 🟢"));
@@ -821,7 +821,7 @@ fn validate_empty_input() {
 fn validate_multiple_items_all_pass() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 INFO first\n2024-01-01 10:00:01 WARN second\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
     assert!(result.output.contains("Processed 2 items"));
     assert!(result.output.contains("Config.toml correct 🟢"));
@@ -846,7 +846,7 @@ fn validate_multiline_item_counted() {
         items: vec![item],
     };
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
     assert!(result.output.contains("Processed 1 items"));
     assert!(result.output.contains("Config.toml correct 🟢"));
@@ -856,7 +856,7 @@ fn validate_multiline_item_counted() {
 fn validate_stops_at_first_non_matching() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 INFO first\ngarbage line\n2024-01-01 10:00:02 INFO third\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.output.contains("Processed 1 items"));
     assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
     let err = result.error.unwrap();
@@ -868,7 +868,7 @@ fn validate_stops_at_first_non_matching() {
 fn validate_error_at_first_line() {
     let config = simple_config();
     let log = "garbage\n2024-01-01 10:00:00 INFO valid\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.output.contains("Processed 0 items"));
     assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
     let err = result.error.unwrap();
@@ -879,8 +879,35 @@ fn validate_error_at_first_line() {
 fn validate_cleans_literal_newlines_in_content() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 INFO hello\\n2024-01-01 10:00:01 WARN world\n";
-    let result = validate(log, &config);
+    let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
     assert!(result.output.contains("Processed 2 items"));
     assert!(result.output.contains("Config.toml correct 🟢"));
+}
+
+// ── max_pattern_line_span ────────────────────────────────────────────
+
+#[test]
+fn max_span_single_line_patterns() {
+    let config = simple_config();
+    assert_eq!(max_pattern_line_span(&config), 1);
+}
+
+#[test]
+fn max_span_multiline_pattern() {
+    let atoms = make_atoms();
+    let parts = vec![
+        RawPart { atom: Some("level".into()), regex: None },
+        RawPart { atom: None, regex: Some(r"\n".into()) },
+        RawPart { atom: Some("message".into()), regex: None },
+    ];
+    let raw = raw_item_with_parts("entry", parts);
+    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let config = Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        blacklist_atoms: vec![],
+        items: vec![item],
+    };
+    assert_eq!(max_pattern_line_span(&config), 2);
 }

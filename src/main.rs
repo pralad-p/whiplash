@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufRead;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -510,43 +511,133 @@ fn clean_log_content(content: &str) -> String {
     result
 }
 
-fn validate(content: &str, config: &Config) -> ValidateResult {
-    let cleaned = clean_log_content(content);
-    let content_lines: Vec<&str> = cleaned.lines().collect();
-    let (items, unparsed) = parse_log(&cleaned, config);
+/// Compute the maximum number of lines any single pattern might span
+/// by counting `\n` escape sequences in each compiled regex.
+fn max_pattern_line_span(config: &Config) -> usize {
+    config
+        .items
+        .iter()
+        .map(|item| {
+            let bytes = item.pattern.as_str().as_bytes();
+            let newline_escapes = bytes
+                .windows(2)
+                .filter(|w| w[0] == b'\\' && w[1] == b'n')
+                .count();
+            newline_escapes + 1
+        })
+        .max()
+        .unwrap_or(1)
+}
 
-    let first_unparsed = unparsed.first().copied();
+/// Stream-based validation: reads from any `BufRead` source line by line,
+/// keeping only a small buffer for multi-line pattern look-ahead.
+/// Stops immediately at the first non-matching line.
+fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult> {
+    let max_span = max_pattern_line_span(config);
+    let mut buf = String::new();
+    let mut line_no: usize = 1;
+    let mut processed: usize = 0;
+    let mut raw_line = String::new();
+    let mut at_eof = false;
 
-    let processed_count = if let Some(up_line) = first_unparsed {
-        items.iter().filter(|item| item.line_no < up_line).count()
-    } else {
-        items.len()
-    };
-
-    let mut out = format!("Processed {} items", processed_count);
-
-    if let Some(up_line) = first_unparsed {
-        let line_content = content_lines
-            .get(up_line - 1)
-            .map(|s| s.trim())
-            .unwrap_or("");
-        let error_msg = format!(
-            "validation error at line {}: no pattern matched '{}'",
-            up_line, line_content
-        );
-        out.push_str(&format!("\n{}", error_msg));
-        out.push_str("\nValidation failed, issue with Config.toml 🔴");
-        ValidateResult {
-            output: out,
-            error: Some(error_msg),
+    loop {
+        // Read one raw line (preserves trailing newline)
+        if !at_eof {
+            raw_line.clear();
+            match reader.read_line(&mut raw_line) {
+                Ok(0) => at_eof = true,
+                Ok(_) => {
+                    let cleaned = clean_log_content(&raw_line);
+                    buf.push_str(&cleaned);
+                    if !cleaned.ends_with('\n') && !cleaned.is_empty() {
+                        buf.push('\n');
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-    } else {
-        out.push_str("\nConfig.toml correct 🟢");
-        ValidateResult {
-            output: out,
-            error: None,
+
+        // Consume matches from the front of buf
+        loop {
+            if buf.is_empty() {
+                break;
+            }
+            let mut matched = false;
+            for compiled in &config.items {
+                if let Some(m) = compiled.pattern.find(&buf) {
+                    if m.start() != 0 {
+                        continue;
+                    }
+                    if compiled.anchored {
+                        let match_end = m.end();
+                        let buf_bytes = buf.as_bytes();
+                        if match_end < buf_bytes.len() {
+                            let prev = if match_end > 0 {
+                                buf_bytes[match_end - 1]
+                            } else {
+                                0
+                            };
+                            if prev != b'\n' && prev != b'\r' {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let span = m.as_str().lines().count().max(1);
+
+                    // Advance past the complete matched lines
+                    let mut consumed = 0;
+                    let mut counted = 0;
+                    let bytes = buf.as_bytes();
+                    while counted < span && consumed < bytes.len() {
+                        if bytes[consumed] == b'\n' {
+                            counted += 1;
+                        }
+                        consumed += 1;
+                    }
+
+                    buf.drain(..consumed);
+                    line_no += span;
+                    processed += 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                break;
+            }
+        }
+
+        // Check for non-matching content in the buffer
+        if !buf.is_empty() {
+            let newlines_in_buf = buf.as_bytes().iter().filter(|&&b| b == b'\n').count();
+            if at_eof || newlines_in_buf >= max_span {
+                let first_line = buf.lines().next().unwrap_or("").trim();
+                let error_msg = format!(
+                    "validation error at line {}: no pattern matched '{}'",
+                    line_no, first_line
+                );
+                let mut out = format!("Processed {} items", processed);
+                out.push_str(&format!("\n{}", error_msg));
+                out.push_str("\nValidation failed, issue with Config.toml 🔴");
+                return Ok(ValidateResult {
+                    output: out,
+                    error: Some(error_msg),
+                });
+            }
+        }
+
+        if at_eof {
+            break;
         }
     }
+
+    let mut out = format!("Processed {} items", processed);
+    out.push_str("\nConfig.toml correct 🟢");
+    Ok(ValidateResult {
+        output: out,
+        error: None,
+    })
 }
 
 // ── main ─────────────────────────────────────────────────────────────
@@ -566,8 +657,10 @@ fn main() -> Result<()> {
     let config = load_config(&cli.config, &cli)?;
 
     if cli.validate {
-        let content = read_file_lossy(&cli.clean_log)?;
-        let result = validate(&content, &config);
+        let file = fs::File::open(&cli.clean_log)
+            .with_context(|| format!("failed to open '{}'", cli.clean_log.display()))?;
+        let reader = std::io::BufReader::new(file);
+        let result = validate(reader, &config)?;
         println!("{}", result.output);
         if result.error.is_some() {
             std::process::exit(1);
