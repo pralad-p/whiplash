@@ -48,11 +48,19 @@ struct RawConfig {
     items: Vec<RawItem>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DelimiterValue {
+    Single(String),
+    List(Vec<String>),
+}
+
 #[derive(Deserialize, Default)]
 struct RawGeneral {
     index_threshold: Option<usize>,
     max_failed_items: Option<usize>,
     blacklist_atoms: Option<Vec<String>>,
+    delimiters: Option<DelimiterValue>, // <-- add
 }
 
 #[derive(Deserialize)]
@@ -87,6 +95,7 @@ struct Config {
     max_failed_items: usize,
     #[allow(dead_code)]
     blacklist_atoms: Vec<String>,
+    delimiters: Vec<Regex>,
     items: Vec<CompiledItem>,
 }
 
@@ -122,6 +131,7 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     }
 
     let general = raw.general.unwrap_or_default();
+    let delimiters = compile_delimiters(&general)?;
     let index_threshold = cli
         .threshold
         .unwrap_or(general.index_threshold.unwrap_or(0));
@@ -136,13 +146,32 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
             .with_context(|| format!("compiling item '{}'", raw_item.name))?;
         compiled_items.push(item);
     }
-
     Ok(Config {
         index_threshold,
         max_failed_items,
         blacklist_atoms,
         items: compiled_items,
+        delimiters,
     })
+}
+
+fn is_delimiter_line(line_without_newline: &str, config: &Config) -> bool {
+    config
+        .delimiters
+        .iter()
+        .any(|re| re.is_match(line_without_newline))
+}
+
+fn compile_delimiters(general: &RawGeneral) -> Result<Vec<Regex>> {
+    let raw: Vec<String> = match &general.delimiters {
+        Some(DelimiterValue::Single(s)) => vec![s.clone()],
+        Some(DelimiterValue::List(v)) => v.clone(),
+        None => vec![],
+    };
+
+    raw.into_iter()
+        .map(|pat| Regex::new(&pat).with_context(|| format!("invalid delimiter regex: {}", pat)))
+        .collect()
 }
 
 fn compile_item(
@@ -257,6 +286,88 @@ struct ParsedItem {
 // ── Log parsing ──────────────────────────────────────────────────────
 
 fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
+    if config.delimiters.is_empty() {
+        return parse_log_legacy(content, config); // your old logic but with anchored removed
+    }
+
+    let lines = split_lines_keepends(content);
+    let mut items = Vec::new();
+    let mut unparsed_blocks = Vec::new();
+
+    let mut block = String::new();
+    let mut block_start_line: usize = 1;
+
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        if is_delimiter_line(stripped, config) {
+            if !block.is_empty() {
+                if let Some(item) = parse_block(&block, block_start_line, config) {
+                    items.push(item);
+                } else {
+                    unparsed_blocks.push(block_start_line);
+                }
+                block.clear();
+            }
+            continue;
+        }
+
+        if block.is_empty() {
+            block_start_line = i + 1; // 1-based
+        }
+        block.push_str(line);
+    }
+
+    if !block.is_empty() {
+        if let Some(item) = parse_block(&block, block_start_line, config) {
+            items.push(item);
+        } else {
+            unparsed_blocks.push(block_start_line);
+        }
+    }
+
+    (items, unparsed_blocks)
+}
+
+fn parse_block(block: &str, start_line_no: usize, config: &Config) -> Option<ParsedItem> {
+    let text = block.trim_end_matches(['\n', '\r']);
+
+    for compiled in &config.items {
+        // Require full-block match:
+        let m = compiled.pattern.find(text)?;
+        if m.start() != 0 || m.end() != text.len() {
+            continue;
+        }
+
+        let caps = compiled.pattern.captures(text)?;
+
+        let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sig_values = Vec::new();
+
+        for (atom_name, group_name) in &compiled.capture_atoms {
+            if let Some(val) = caps.name(group_name) {
+                let val_str = val.as_str().to_string();
+                atom_values
+                    .entry(atom_name.clone())
+                    .or_default()
+                    .push(val_str.clone());
+                if !compiled.ignore_set.contains(atom_name) {
+                    sig_values.push(val_str);
+                }
+            }
+        }
+
+        return Some(ParsedItem {
+            line_no: start_line_no,
+            raw_line: text.to_string(),
+            atom_values,
+            signature: (compiled.name.clone(), sig_values),
+        });
+    }
+
+    None
+}
+
+fn parse_log_legacy(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
     let lines: Vec<&str> = split_lines_keepends(content);
     let mut items = Vec::new();
     let mut unparsed_lines = Vec::new();
@@ -579,7 +690,7 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
                     break;
                 }
                 // This prefix matched — extract capture value if it's an atom part
-                let captured = if parts[i].label != "(regex)" {
+                let captured = if parts[i].label != "(joining-regex)" {
                     re.captures(content).and_then(|caps| {
                         // Find the last capture group (the one just added in this prefix)
                         caps.get(caps.len() - 1).map(|m| m.as_str().to_string())
@@ -644,10 +755,111 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
     out
 }
 
+fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult> {
+    if config.delimiters.is_empty() {
+        return validate_legacy(reader, config); // your current validate() but anchored removed
+    }
+
+    let mut processed: usize = 0;
+
+    let mut block = String::new();
+    let mut block_start_line: usize = 1;
+    let mut line_no: usize = 1;
+
+    loop {
+        let mut raw = String::new();
+        let n = reader.read_line(&mut raw)?;
+        let eof = n == 0;
+
+        if !eof {
+            // Keep your cleaning behavior, but split into real lines afterward
+            let mut cleaned = clean_log_content(&raw);
+            if !cleaned.ends_with('\n') && !cleaned.is_empty() {
+                cleaned.push('\n');
+            }
+
+            for line in split_lines_keepends(&cleaned) {
+                let stripped = line.trim_end_matches(['\n', '\r']);
+
+                if is_delimiter_line(stripped, config) {
+                    if !block.is_empty() {
+                        if !block_matches_any_item(&block, config) {
+                            let first_line = block.lines().next().unwrap_or("").trim();
+                            let error_msg = format!(
+                                "validation error at line {}: no pattern matched '{}'",
+                                block_start_line, first_line
+                            );
+                            let diagnostic =
+                                diagnose_mismatch(block.trim_end_matches(['\n', '\r']), config);
+                            let mut out = format!("Processed {} items", processed);
+                            out.push_str(&format!("\n{}", error_msg));
+                            out.push_str(&format!("\n{}", diagnostic.trim_end()));
+                            out.push_str("\nValidation failed, issue with Config.toml 🔴");
+                            return Ok(ValidateResult {
+                                output: out,
+                                error: Some(error_msg),
+                            });
+                        }
+
+                        processed += 1;
+                        block.clear();
+                    }
+                    line_no += 1;
+                    continue;
+                }
+
+                if block.is_empty() {
+                    block_start_line = line_no;
+                }
+                block.push_str(line);
+                line_no += 1;
+            }
+        }
+
+        if eof {
+            break;
+        }
+    }
+
+    if !block.is_empty() {
+        if !block_matches_any_item(&block, config) {
+            let first_line = block.lines().next().unwrap_or("").trim();
+            let error_msg = format!(
+                "validation error at line {}: no pattern matched '{}'",
+                block_start_line, first_line
+            );
+            let diagnostic = diagnose_mismatch(block.trim_end_matches(['\n', '\r']), config);
+            let mut out = format!("Processed {} items", processed);
+            out.push_str(&format!("\n{}", error_msg));
+            out.push_str(&format!("\n{}", diagnostic.trim_end()));
+            out.push_str("\nValidation failed, issue with Config.toml 🔴");
+            return Ok(ValidateResult {
+                output: out,
+                error: Some(error_msg),
+            });
+        }
+        processed += 1;
+    }
+
+    Ok(ValidateResult {
+        output: format!("Processed {} items\nConfig.toml correct 🟢", processed),
+        error: None,
+    })
+}
+
+fn block_matches_any_item(block: &str, config: &Config) -> bool {
+    let text = block.trim_end_matches(['\n', '\r']);
+    config.items.iter().any(|item| {
+        item.pattern
+            .find(text)
+            .is_some_and(|m| m.start() == 0 && m.end() == text.len())
+    })
+}
+
 /// Stream-based validation: reads from any `BufRead` source line by line,
 /// keeping only a small buffer for multi-line pattern look-ahead.
 /// Stops immediately at the first non-matching line.
-fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult> {
+fn validate_legacy(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult> {
     let max_span = max_pattern_line_span(config);
     let mut buf = String::new();
     let mut line_no: usize = 1;
