@@ -1,0 +1,3 @@
+# whiplash
+
+Log comparator.
