@@ -466,36 +466,87 @@ fn print_output(result: &CompareResult, clean_items: &[ParsedItem], dirty_items:
 
 // ── Validate ─────────────────────────────────────────────────────────
 
-fn validate(content: &str, config: &Config) -> String {
-    let (items, _) = parse_log(content, config);
+struct ValidateResult {
+    output: String,
+    error: Option<String>,
+}
 
-    if items.is_empty() {
-        return "No items matched.".to_string();
-    }
+/// Replace literal `\n` and `\r\n` text sequences with actual newlines.
+/// If the sequence is already followed by an actual newline, the literal
+/// sequence is removed without inserting a duplicate newline.
+fn clean_log_content(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let len = chars.len();
+    let mut result = String::with_capacity(content.len());
+    let mut i = 0;
 
-    let item = &items[0];
-
-    // Find the compiled item that matched so we can iterate capture_atoms in order
-    let compiled = config.items.iter().find(|c| c.name == item.name).unwrap();
-
-    let mut out = format!("Item: {} (line {})\n", item.name, item.line_no);
-    let mut lines = item.raw_line.lines();
-    if let Some(first) = lines.next() {
-        out.push_str(&format!("  Raw: {}\n", first));
-        for line in lines {
-            out.push_str(&format!("       {}\n", line));
-        }
-    }
-
-    for (atom_name, _) in &compiled.capture_atoms {
-        if let Some(vals) = item.atom_values.get(atom_name) {
-            for val in vals {
-                out.push_str(&format!("  {} = \"{}\"\n", atom_name, val));
+    while i < len {
+        if chars[i] == '\\' {
+            // Check for literal \r\n (4 chars: \, r, \, n)
+            if i + 3 < len
+                && chars[i + 1] == 'r'
+                && chars[i + 2] == '\\'
+                && chars[i + 3] == 'n'
+            {
+                if i + 4 >= len || chars[i + 4] != '\n' {
+                    result.push('\n');
+                }
+                i += 4;
+                continue;
+            }
+            // Check for literal \n (2 chars: \, n)
+            if i + 1 < len && chars[i + 1] == 'n' {
+                if i + 2 >= len || chars[i + 2] != '\n' {
+                    result.push('\n');
+                }
+                i += 2;
+                continue;
             }
         }
+        result.push(chars[i]);
+        i += 1;
     }
 
-    out.trim_end().to_string()
+    result
+}
+
+fn validate(content: &str, config: &Config) -> ValidateResult {
+    let cleaned = clean_log_content(content);
+    let content_lines: Vec<&str> = cleaned.lines().collect();
+    let (items, unparsed) = parse_log(&cleaned, config);
+
+    let first_unparsed = unparsed.first().copied();
+
+    let processed_count = if let Some(up_line) = first_unparsed {
+        items.iter().filter(|item| item.line_no < up_line).count()
+    } else {
+        items.len()
+    };
+
+    let mut out = format!("Processed {} items", processed_count);
+
+    if let Some(up_line) = first_unparsed {
+        let line_content = content_lines
+            .get(up_line - 1)
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let error_msg = format!(
+            "validation error at line {}: no pattern matched '{}'",
+            up_line, line_content
+        );
+        out.push_str(&format!("\n{}", error_msg));
+        out.push_str("\nValidation failed, issue with Config.toml 🔴");
+        ValidateResult {
+            output: out,
+            error: Some(error_msg),
+        }
+    } else {
+        out.push_str("\nConfig.toml correct 🟢");
+        ValidateResult {
+            output: out,
+            error: None,
+        }
+    }
 }
 
 // ── main ─────────────────────────────────────────────────────────────
@@ -516,8 +567,11 @@ fn main() -> Result<()> {
 
     if cli.validate {
         let content = read_file_lossy(&cli.clean_log)?;
-        let output = validate(&content, &config);
-        println!("{}", output);
+        let result = validate(&content, &config);
+        println!("{}", result.output);
+        if result.error.is_some() {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
