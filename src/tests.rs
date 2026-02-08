@@ -911,3 +911,94 @@ fn max_span_multiline_pattern() {
     };
     assert_eq!(max_pattern_line_span(&config), 2);
 }
+
+// ── diagnose_mismatch ────────────────────────────────────────────────
+
+#[test]
+fn diagnose_partial_match_single_item() {
+    let config = simple_config();
+    // timestamp matches, space matches, but "BADLEVEL" doesn't match level atom
+    let content = "2024-01-01 10:00:00 BADLEVEL hello\n";
+    let diag = diagnose_mismatch(content, &config);
+    assert!(diag.contains("item 'log_entry'"));
+    assert!(diag.contains("matched 2/5 parts")); // timestamp + " " matched, level fails
+    assert!(diag.contains("timestamp"));
+    assert!(diag.contains("[matched]"));
+    assert!(diag.contains("level"));
+    assert!(diag.contains("[no match]"));
+}
+
+#[test]
+fn diagnose_no_parts_match() {
+    let config = simple_config();
+    // nothing matches even the first atom (timestamp)
+    let content = "completely random garbage\n";
+    let diag = diagnose_mismatch(content, &config);
+    assert!(diag.contains("item 'log_entry'"));
+    assert!(diag.contains("matched 0/5 parts"));
+    assert!(diag.contains("timestamp"));
+    assert!(diag.contains("[no match]"));
+}
+
+#[test]
+fn diagnose_best_match_selection_multiple_items() {
+    let atoms = make_atoms();
+    // Item 1: level + " " + message (3 parts)
+    let parts1 = atom_parts(&["level", "message"], Some(" "));
+    let raw1 = raw_item_with_parts("short_entry", parts1);
+    let item1 = compile_item(&raw1, &atoms, &[]).unwrap();
+
+    // Item 2: timestamp + " " + level + " " + message (5 parts)
+    let parts2 = atom_parts(&["timestamp", "level", "message"], Some(" "));
+    let raw2 = raw_item_with_parts("full_entry", parts2);
+    let item2 = compile_item(&raw2, &atoms, &[]).unwrap();
+
+    let config = Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        blacklist_atoms: vec![],
+        items: vec![item1, item2],
+    };
+
+    // Content: timestamp and space match in full_entry, but level fails
+    // short_entry: level fails immediately (0 parts)
+    // full_entry: timestamp + " " match (2 parts), level fails
+    let content = "2024-01-01 10:00:00 BADLEVEL hello\n";
+    let diag = diagnose_mismatch(content, &config);
+    // full_entry should be the best match since it matched more parts
+    assert!(diag.contains("item 'full_entry'"));
+    assert!(diag.contains("matched 2/5 parts")); // timestamp + (regex " ") matched, level fails
+}
+
+#[test]
+fn diagnose_with_flags_ignorecase() {
+    let atoms = make_atoms();
+    let parts = atom_parts(&["level", "message"], Some(" "));
+    let mut raw = raw_item_with_parts("entry", parts);
+    raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
+    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let config = Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        blacklist_atoms: vec![],
+        items: vec![item],
+    };
+
+    // With IGNORECASE, "info" should match the level atom
+    let content = "info hello\n";
+    let diag = diagnose_mismatch(content, &config);
+    // All parts should match
+    assert!(diag.contains("matched 3/3 parts"));
+}
+
+#[test]
+fn validate_diagnostic_in_error_output() {
+    let config = simple_config();
+    let log = "2024-01-01 10:00:00 BADLEVEL hello\n";
+    let result = validate(log.as_bytes(), &config).unwrap();
+    assert!(result.error.is_some());
+    assert!(result.output.contains("Best match: item 'log_entry'"));
+    assert!(result.output.contains("[matched]"));
+    assert!(result.output.contains("[no match]"));
+    assert!(result.output.contains("Validation failed, issue with Config.toml 🔴"));
+}

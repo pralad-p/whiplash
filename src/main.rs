@@ -87,6 +87,11 @@ struct Config {
     items: Vec<CompiledItem>,
 }
 
+struct DiagnosticPart {
+    label: String,    // atom name or "(regex)" for inline regex
+    fragment: String, // the raw regex fragment for this part
+}
+
 struct CompiledItem {
     name: String,
     pattern: Regex,
@@ -95,6 +100,10 @@ struct CompiledItem {
     capture_atoms: Vec<(String, String)>, // (atom_name, capture_group_name)
     /// Atoms to ignore in signature.
     ignore_set: Vec<String>,
+    /// Ordered parts for diagnostic output on validation failure.
+    diagnostic_parts: Vec<DiagnosticPart>,
+    /// Flags prefix e.g. "(?ims)" or "", needed to reconstruct partial patterns.
+    flags_prefix: String,
 }
 
 // ── Config loading & validation ──────────────────────────────────────
@@ -151,6 +160,7 @@ fn compile_item(
     let mut pattern_str = String::new();
     let mut capture_atoms: Vec<(String, String)> = Vec::new();
     let mut ordinal_counter: HashMap<String, usize> = HashMap::new();
+    let mut diagnostic_parts: Vec<DiagnosticPart> = Vec::new();
 
     for part in parts {
         match (&part.atom, &part.regex) {
@@ -162,10 +172,19 @@ fn compile_item(
                 let group_name = format!("{}__{}", atom_name, ord);
                 *ord += 1;
                 capture_atoms.push((atom_name.clone(), group_name.clone()));
-                pattern_str.push_str(&format!("(?P<{}>{})", group_name, atom_regex));
+                let fragment = format!("(?P<{}>{})", group_name, atom_regex);
+                pattern_str.push_str(&fragment);
+                diagnostic_parts.push(DiagnosticPart {
+                    label: atom_name.clone(),
+                    fragment,
+                });
             }
             (None, Some(regex_frag)) => {
                 pattern_str.push_str(regex_frag);
+                diagnostic_parts.push(DiagnosticPart {
+                    label: format!("(regex)"),
+                    fragment: regex_frag.clone(),
+                });
             }
             _ => bail!("part must have exactly one of `atom` or `regex`"),
         }
@@ -186,9 +205,13 @@ fn compile_item(
         }
     }
 
-    if !flag_str.is_empty() {
-        pattern_str = format!("(?{}){}", flag_str, pattern_str);
-    }
+    let flags_prefix = if !flag_str.is_empty() {
+        let prefix = format!("(?{})", flag_str);
+        pattern_str = format!("{}{}", prefix, pattern_str);
+        prefix
+    } else {
+        String::new()
+    };
 
     debug!(item = %raw.name, pattern = %pattern_str, "compiled pattern");
 
@@ -204,6 +227,8 @@ fn compile_item(
         anchored: raw.anchored.unwrap_or(false),
         capture_atoms,
         ignore_set,
+        diagnostic_parts,
+        flags_prefix,
     })
 }
 
@@ -529,6 +554,107 @@ fn max_pattern_line_span(config: &Config) -> usize {
         .unwrap_or(1)
 }
 
+/// Diagnose why no pattern matched `content` by progressively testing
+/// longer prefixes of each item's pattern. Returns a formatted string
+/// showing the best partial match and where it broke.
+fn diagnose_mismatch(content: &str, config: &Config) -> String {
+    let mut best_item_name = "";
+    let mut best_total_parts = 0;
+    let mut best_matched_count: Option<usize> = None;
+    let mut best_matched_labels: Vec<(String, Option<String>)> = Vec::new(); // (label, captured_value)
+    let mut best_failed_label: Option<String> = None;
+    let mut best_remaining_count = 0;
+
+    for item in &config.items {
+        let parts = &item.diagnostic_parts;
+        let total = parts.len();
+        let mut matched_count: usize = 0;
+        let mut matched_labels: Vec<(String, Option<String>)> = Vec::new();
+        let mut failed_label: Option<String> = None;
+
+        for i in 0..total {
+            // Build prefix pattern from parts[0..=i]
+            let mut prefix_pattern = item.flags_prefix.clone();
+            for p in &parts[..=i] {
+                prefix_pattern.push_str(&p.fragment);
+            }
+
+            // Try to compile and match at the start of content
+            let Ok(re) = Regex::new(&prefix_pattern) else {
+                failed_label = Some(parts[i].label.clone());
+                break;
+            };
+
+            if let Some(m) = re.find(content) {
+                if m.start() != 0 {
+                    failed_label = Some(parts[i].label.clone());
+                    break;
+                }
+                // This prefix matched — extract capture value if it's an atom part
+                let captured = if parts[i].label != "(regex)" {
+                    re.captures(content).and_then(|caps| {
+                        // Find the last capture group (the one just added in this prefix)
+                        caps.get(caps.len() - 1).map(|m| m.as_str().to_string())
+                    })
+                } else {
+                    None
+                };
+                matched_labels.push((parts[i].label.clone(), captured));
+                matched_count = i + 1;
+            } else {
+                failed_label = Some(parts[i].label.clone());
+                break;
+            }
+        }
+
+        let dominated = match best_matched_count {
+            None => true,
+            Some(best) => matched_count > best
+                || (matched_count == best && total < best_total_parts),
+        };
+        if dominated {
+            best_item_name = &item.name;
+            best_total_parts = total;
+            best_matched_count = Some(matched_count);
+            best_matched_labels = matched_labels;
+            best_failed_label = failed_label;
+            best_remaining_count = total.saturating_sub(matched_count).saturating_sub(
+                if best_failed_label.is_some() { 1 } else { 0 },
+            );
+        }
+    }
+
+    let mut out = String::new();
+    let matched = best_matched_count.unwrap_or(0);
+    out.push_str(&format!(
+        "  Best match: item '{}' (matched {}/{} parts)\n",
+        best_item_name, matched, best_total_parts
+    ));
+
+    for (label, captured) in &best_matched_labels {
+        if label == "(regex)" {
+            out.push_str(&format!("    {:40} [matched]\n", format!("\"{}\"", label)));
+        } else if let Some(val) = captured {
+            out.push_str(&format!(
+                "    {:40} [matched]\n",
+                format!("{} = \"{}\"", label, val)
+            ));
+        } else {
+            out.push_str(&format!("    {:40} [matched]\n", label));
+        }
+    }
+
+    if let Some(ref label) = best_failed_label {
+        out.push_str(&format!("    {:40} [no match]\n", label));
+    }
+
+    if best_remaining_count > 0 {
+        out.push_str("    ...\n");
+    }
+
+    out
+}
+
 /// Stream-based validation: reads from any `BufRead` source line by line,
 /// keeping only a small buffer for multi-line pattern look-ahead.
 /// Stops immediately at the first non-matching line.
@@ -617,8 +743,10 @@ fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult>
                     "validation error at line {}: no pattern matched '{}'",
                     line_no, first_line
                 );
+                let diagnostic = diagnose_mismatch(&buf, config);
                 let mut out = format!("Processed {} items", processed);
                 out.push_str(&format!("\n{}", error_msg));
+                out.push_str(&format!("\n{}", diagnostic.trim_end()));
                 out.push_str("\nValidation failed, issue with Config.toml 🔴");
                 return Ok(ValidateResult {
                     output: out,
