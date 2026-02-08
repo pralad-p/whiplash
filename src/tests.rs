@@ -724,3 +724,70 @@ fn integration_unparsed_lines_skipped() {
     assert_eq!(unparsed.len(), 2);
     assert_eq!(unparsed, vec![1, 3]);
 }
+
+// ── validate ─────────────────────────────────────────────────────────
+
+#[test]
+fn validate_first_match() {
+    let config = simple_config();
+    let log = "2024-01-01 10:00:00 INFO hello world\n";
+    let output = validate(log, &config);
+    assert!(output.starts_with("Item: log_entry (line 1)"));
+    assert!(output.contains("Raw: 2024-01-01 10:00:00 INFO hello world"));
+    assert!(output.contains("timestamp = \"2024-01-01 10:00:00\""));
+    assert!(output.contains("level = \"INFO\""));
+    assert!(output.contains("message = \"hello world\""));
+}
+
+#[test]
+fn validate_no_match() {
+    let config = simple_config();
+    let log = "this does not match anything\n";
+    let output = validate(log, &config);
+    assert_eq!(output, "No items matched.");
+}
+
+#[test]
+fn validate_multiple_items_shows_first() {
+    let config = simple_config();
+    let log = "2024-01-01 10:00:00 INFO first\n2024-01-01 10:00:01 WARN second\n";
+    let output = validate(log, &config);
+    assert!(output.contains("Item: log_entry (line 1)"));
+    assert!(output.contains("message = \"first\""));
+    assert!(!output.contains("second"));
+}
+
+#[test]
+fn validate_shows_all_atom_values() {
+    let config = simple_config();
+    let log = "2024-01-01 10:00:00 ERROR something broke\n";
+    let output = validate(log, &config);
+    assert!(output.contains("timestamp = \"2024-01-01 10:00:00\""));
+    assert!(output.contains("level = \"ERROR\""));
+    assert!(output.contains("message = \"something broke\""));
+}
+
+#[test]
+fn validate_multiline_raw_indented() {
+    let atoms = make_atoms();
+    // An item whose regex spans two lines: timestamp + level on line 1, message on line 2
+    let parts = vec![
+        RawPart { atom: Some("timestamp".into()), regex: None },
+        RawPart { atom: None, regex: Some(" ".into()) },
+        RawPart { atom: Some("level".into()), regex: None },
+        RawPart { atom: None, regex: Some(r"\n".into()) },
+        RawPart { atom: Some("message".into()), regex: None },
+    ];
+    let raw = raw_item_with_parts("multiline_entry", parts);
+    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let config = Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        blacklist_atoms: vec![],
+        items: vec![item],
+    };
+    let log = "2024-01-01 10:00:00 INFO\nhello world\n";
+    let output = validate(log, &config);
+    assert!(output.contains("  Raw: 2024-01-01 10:00:00 INFO"));
+    assert!(output.contains("       hello world"));
+}
