@@ -1,0 +1,33 @@
+# Demonstrates multiline patterns: items that span more than one line.
+#
+# Useful for log formats where entries include continuation lines,
+# such as Java stack traces or multi-line SQL queries.
+#
+# Matches blocks like:
+#   2024-01-15 09:30:00 ERROR NullPointerException
+#     at com.example.App.main(App.java:42)
+
+[atoms]
+timestamp  = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+level      = "INFO|WARN|ERROR"
+exception  = "[A-Za-z.]+"
+stacktrace = "  at .+"
+
+# Single-line log entry (tried first)
+[[items]]
+name = "log_entry"
+anchored = true
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "exception"
+[[items.parts]]
+regex = "\\n"
+[[items.parts]]
+atom = "stacktrace"

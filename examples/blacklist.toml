@@ -1,0 +1,30 @@
+# Demonstrates blacklist_atoms: globally exclude timestamps and PIDs
+# from matching signatures so that lines are compared by their
+# content alone, regardless of when or which process produced them.
+
+[general]
+blacklist_atoms = ["timestamp", "pid"]
+
+[atoms]
+timestamp = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+pid       = "\\d+"
+level     = "INFO|WARN|ERROR"
+message   = ".+"
+
+# Matches: 2024-01-15 09:30:00 [12345] INFO Server started
+[[items]]
+name = "log_entry"
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " \\["
+[[items.parts]]
+atom = "pid"
+[[items.parts]]
+regex = "\\] "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "message"

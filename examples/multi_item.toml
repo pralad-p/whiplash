@@ -1,0 +1,70 @@
+# Demonstrates multiple item types with pattern priority.
+#
+# Items are tried in configuration order; the first matching pattern
+# wins.  Place more specific patterns before general catch-all patterns.
+#
+# This config parses a web server log that contains three distinct
+# entry types: HTTP requests, health-check pings, and general messages.
+
+[general]
+index_threshold = 1
+
+[atoms]
+timestamp = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+method    = "GET|POST|PUT|DELETE|PATCH|HEAD"
+path      = "/[^ ]*"
+status    = "\\d{3}"
+level     = "INFO|WARN|ERROR|DEBUG"
+message   = ".+"
+
+# Most specific: health-check requests (exact path)
+# e.g.: 2024-01-15 09:30:00 GET /healthz 200
+[[items]]
+name = "health_check"
+ignore_atoms = ["timestamp"]
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "method"
+[[items.parts]]
+regex = " /healthz "
+[[items.parts]]
+atom = "status"
+
+# HTTP requests (any path)
+# e.g.: 2024-01-15 09:30:00 POST /api/users 201
+[[items]]
+name = "http_request"
+ignore_atoms = ["timestamp"]
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "method"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "path"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "status"
+
+# Catch-all: general log messages
+# e.g.: 2024-01-15 09:30:00 INFO Server started on port 8080
+[[items]]
+name = "general_log"
+ignore_atoms = ["timestamp"]
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "message"
