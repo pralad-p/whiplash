@@ -93,8 +93,6 @@ struct RawPart {
 struct Config {
     index_threshold: usize,
     max_failed_items: usize,
-    #[allow(dead_code)]
-    blacklist_atoms: Vec<String>,
     delimiters: Vec<Regex>,
     items: Vec<CompiledItem>,
 }
@@ -149,7 +147,6 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     Ok(Config {
         index_threshold,
         max_failed_items,
-        blacklist_atoms,
         items: compiled_items,
         delimiters,
     })
