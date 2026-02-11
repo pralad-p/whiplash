@@ -51,7 +51,6 @@ fn simple_config() -> Config {
     Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec![],
         delimiters: vec![], // legacy mode
         items: vec![item],
     }
@@ -499,7 +498,6 @@ fn parse_log_signature_excludes_ignored_atoms() {
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec![],
         delimiters: vec![],
         items: vec![item],
     };
@@ -802,7 +800,6 @@ fn integration_blacklist_ignores_timestamp() {
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec!["timestamp".into()],
         delimiters: vec![],
         items: vec![item],
     };
@@ -969,7 +966,6 @@ fn validate_multiline_item_counted() {
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec![],
         delimiters: vec![],
         items: vec![item],
     };
@@ -1094,7 +1090,6 @@ fn max_span_multiline_pattern() {
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec![],
         delimiters: vec![],
         items: vec![item],
     };
@@ -1145,7 +1140,6 @@ fn diagnose_best_match_selection_multiple_items() {
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec![],
         delimiters: vec![],
         items: vec![item1, item2],
     };
@@ -1170,7 +1164,6 @@ fn diagnose_with_flags_ignorecase() {
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        blacklist_atoms: vec![],
         delimiters: vec![],
         items: vec![item],
     };
