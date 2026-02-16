@@ -138,9 +138,10 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
         .unwrap_or(general.max_failed_items.unwrap_or(0));
     let blacklist_atoms = general.blacklist_atoms.unwrap_or_default();
 
+    let full_match = !delimiters.is_empty();
     let mut compiled_items = Vec::new();
     for raw_item in &raw.items {
-        let item = compile_item(raw_item, &raw.atoms, &blacklist_atoms)
+        let item = compile_item(raw_item, &raw.atoms, &blacklist_atoms, full_match)
             .with_context(|| format!("compiling item '{}'", raw_item.name))?;
         compiled_items.push(item);
     }
@@ -175,6 +176,7 @@ fn compile_item(
     raw: &RawItem,
     atoms: &HashMap<String, String>,
     blacklist: &[String],
+    full_match: bool,
 ) -> Result<CompiledItem> {
     if raw.name.is_empty() {
         bail!("item name must be non-empty");
@@ -250,6 +252,13 @@ fn compile_item(
     } else {
         String::new()
     };
+
+    // Anchor pattern: \A ensures match starts at position 0 (both modes need this).
+    // \z ensures match covers entire text (delimiter mode only).
+    pattern_str = format!("\\A{}", pattern_str);
+    if full_match {
+        pattern_str.push_str("\\z");
+    }
 
     debug!(item = %raw.name, pattern = %pattern_str, "compiled pattern");
 
@@ -329,13 +338,11 @@ fn parse_block(block: &str, start_line_no: usize, config: &Config) -> Option<Par
     let text = block.trim_end_matches(['\n', '\r']);
 
     for compiled in &config.items {
-        // Require full-block match:
-        let m = compiled.pattern.find(text)?;
-        if m.start() != 0 || m.end() != text.len() {
-            continue;
-        }
-
-        let caps = compiled.pattern.captures(text)?;
+        // Pattern is anchored with \A...\z, so captures() only succeeds on full match.
+        let caps = match compiled.pattern.captures(text) {
+            Some(caps) => caps,
+            None => continue,
+        };
 
         let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
         let mut sig_values = Vec::new();
@@ -343,13 +350,13 @@ fn parse_block(block: &str, start_line_no: usize, config: &Config) -> Option<Par
         for (atom_name, group_name) in &compiled.capture_atoms {
             if let Some(val) = caps.name(group_name) {
                 let val_str = val.as_str().to_string();
+                if !compiled.ignore_set.contains(atom_name) {
+                    sig_values.push(val_str.clone());
+                }
                 atom_values
                     .entry(atom_name.clone())
                     .or_default()
-                    .push(val_str.clone());
-                if !compiled.ignore_set.contains(atom_name) {
-                    sig_values.push(val_str);
-                }
+                    .push(val_str);
             }
         }
 
@@ -369,23 +376,19 @@ fn parse_log_legacy(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usi
     let mut items = Vec::new();
     let mut unparsed_lines = Vec::new();
     let mut pos = 0;
+    let content_start = content.as_ptr() as usize;
 
     while pos < lines.len() {
-        let remaining: String = lines[pos..].concat();
+        // Zero-copy: slice into original content instead of concatenating remaining lines.
+        let offset = lines[pos].as_ptr() as usize - content_start;
+        let remaining = &content[offset..];
         let mut matched = false;
 
         for compiled in &config.items {
-            if let Some(m) = compiled.pattern.find(&remaining) {
-                // Match must start at the beginning of the remaining text
-                if m.start() != 0 {
-                    continue;
-                }
-
-                // Extract captures
-                let caps = compiled.pattern.captures(&remaining).unwrap();
-                let matched_text = m.as_str();
-
-                // Count how many lines the match spans
+            // Pattern is anchored with \A, so only matches at position 0 — no full-string search.
+            // Single captures() call instead of find() + captures().
+            if let Some(caps) = compiled.pattern.captures(remaining) {
+                let matched_text = caps.get(0).unwrap().as_str();
                 let lines_spanned = matched_text.lines().count().max(1);
 
                 let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
@@ -393,13 +396,13 @@ fn parse_log_legacy(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usi
                 for (atom_name, group_name) in &compiled.capture_atoms {
                     if let Some(val) = caps.name(group_name) {
                         let val_str = val.as_str().to_string();
+                        if !compiled.ignore_set.contains(atom_name) {
+                            sig_values.push(val_str.clone());
+                        }
                         atom_values
                             .entry(atom_name.clone())
                             .or_default()
-                            .push(val_str.clone());
-                        if !compiled.ignore_set.contains(atom_name) {
-                            sig_values.push(val_str);
-                        }
+                            .push(val_str);
                     }
                 }
 
@@ -516,8 +519,8 @@ fn compare(
     let mut stopped = false;
     let mut stop_reason: Option<String> = None;
 
-    for (di, _) in dirty_to_clean.iter().enumerate().take(dirty_items.len()) {
-        if let Some(ci) = dirty_to_clean[di] {
+    for (di, mapped) in dirty_to_clean.iter().enumerate() {
+        if let Some(&ci) = mapped.as_ref() {
             events.push(CompareEvent::Match {
                 clean_idx: ci,
                 dirty_idx: di,
@@ -539,8 +542,8 @@ fn compare(
 
     // Append Missing for unmatched clean items (skip if stopped)
     if !stopped {
-        for (ci, _) in clean_matched.iter().enumerate().take(clean_items.len()) {
-            if !clean_matched[ci] {
+        for (ci, &matched) in clean_matched.iter().enumerate() {
+            if !matched {
                 events.push(CompareEvent::Missing { clean_idx: ci });
             }
         }
@@ -601,35 +604,38 @@ struct ValidateResult {
 /// If the sequence is already followed by an actual newline, the literal
 /// sequence is removed without inserting a duplicate newline.
 fn clean_log_content(content: &str) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let len = chars.len();
-    let mut result = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut result = Vec::with_capacity(len);
     let mut i = 0;
 
     while i < len {
-        if chars[i] == '\\' {
-            // Check for literal \r\n (4 chars: \, r, \, n)
-            if i + 3 < len && chars[i + 1] == 'r' && chars[i + 2] == '\\' && chars[i + 3] == 'n' {
-                if i + 4 >= len || chars[i + 4] != '\n' {
-                    result.push('\n');
+        if bytes[i] == b'\\' {
+            // Check for literal \r\n (4 bytes: \, r, \, n)
+            if i + 3 < len && bytes[i + 1] == b'r' && bytes[i + 2] == b'\\' && bytes[i + 3] == b'n'
+            {
+                if i + 4 >= len || bytes[i + 4] != b'\n' {
+                    result.push(b'\n');
                 }
                 i += 4;
                 continue;
             }
-            // Check for literal \n (2 chars: \, n)
-            if i + 1 < len && chars[i + 1] == 'n' {
-                if i + 2 >= len || chars[i + 2] != '\n' {
-                    result.push('\n');
+            // Check for literal \n (2 bytes: \, n)
+            if i + 1 < len && bytes[i + 1] == b'n' {
+                if i + 2 >= len || bytes[i + 2] != b'\n' {
+                    result.push(b'\n');
                 }
                 i += 2;
                 continue;
             }
         }
-        result.push(chars[i]);
+        result.push(bytes[i]);
         i += 1;
     }
 
-    result
+    // Safety: we only substitute ASCII byte sequences (\, r, n) while passing all
+    // other bytes (including multi-byte UTF-8) through unchanged, preserving validity.
+    String::from_utf8(result).expect("clean_log_content: output must be valid UTF-8")
 }
 
 /// Compute the maximum number of lines any single pattern might span
@@ -846,11 +852,7 @@ fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult>
 
 fn block_matches_any_item(block: &str, config: &Config) -> bool {
     let text = block.trim_end_matches(['\n', '\r']);
-    config.items.iter().any(|item| {
-        item.pattern
-            .find(text)
-            .is_some_and(|m| m.start() == 0 && m.end() == text.len())
-    })
+    config.items.iter().any(|item| item.pattern.is_match(text))
 }
 
 /// Stream-based validation: reads from any `BufRead` source line by line,
@@ -889,10 +891,7 @@ fn validate_legacy(mut reader: impl BufRead, config: &Config) -> Result<Validate
             let mut matched = false;
             for compiled in &config.items {
                 if let Some(m) = compiled.pattern.find(&buf) {
-                    if m.start() != 0 {
-                        continue;
-                    }
-
+                    // \A anchoring guarantees m.start() == 0.
                     let span = m.as_str().lines().count().max(1);
 
                     // Advance past the complete matched lines

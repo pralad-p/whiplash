@@ -44,20 +44,24 @@ fn atom_parts(atom_names: &[&str], joiner: Option<&str>) -> Vec<RawPart> {
 }
 
 fn simple_config() -> Config {
+    simple_config_inner(false)
+}
+
+fn simple_config_inner(full_match: bool) -> Config {
     let atoms = make_atoms();
     let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw = raw_item_with_parts("log_entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], full_match).unwrap();
     Config {
         index_threshold: 0,
         max_failed_items: 0,
-        delimiters: vec![], // legacy mode
+        delimiters: vec![],
         items: vec![item],
     }
 }
 
 fn simple_delimited_config(delim_pat: &str) -> Config {
-    let mut cfg = simple_config();
+    let mut cfg = simple_config_inner(true);
     cfg.delimiters = vec![Regex::new(delim_pat).unwrap()];
     cfg
 }
@@ -187,7 +191,7 @@ fn compile_item_with_parts_atom_and_regex() {
         },
     ];
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     assert!(item.pattern.is_match("INFO: hello world"));
     assert!(!item.pattern.is_match("INFO hello world"));
 }
@@ -197,7 +201,7 @@ fn compile_item_with_wildcard_regex_between_atoms() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level", "message"], None);
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     assert_eq!(item.name, "entry");
     assert!(item.pattern.is_match("INFO something happened"));
 }
@@ -207,7 +211,7 @@ fn compile_item_with_space_regex_between_atoms() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level", "message"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     assert!(item.pattern.is_match("ERROR crash"));
     // Joiner is literal space, so "ERROR\tcrash" should not match (tab instead of space)
     assert!(!item.pattern.is_match("ERROR\tcrash"));
@@ -218,7 +222,7 @@ fn compile_item_empty_name_rejected() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level"], None);
     let raw = raw_item_with_parts("", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
@@ -230,7 +234,7 @@ fn compile_item_no_parts_rejected() {
         flags: None,
         ignore_atoms: None,
     };
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
@@ -242,14 +246,14 @@ fn compile_item_unknown_atom_in_part_rejected() {
         ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
 fn compile_item_empty_parts_rejected() {
     let atoms = make_atoms();
     let raw = raw_item_with_parts("entry", vec![]);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
@@ -261,7 +265,7 @@ fn compile_item_part_with_both_atom_and_regex_rejected() {
         ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
@@ -273,7 +277,7 @@ fn compile_item_part_with_neither_rejected() {
         ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
@@ -282,7 +286,7 @@ fn compile_item_flags_ignorecase() {
     let parts = atom_parts(&["level"], None);
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     assert!(item.pattern.is_match("info"));
     assert!(item.pattern.is_match("INFO"));
 }
@@ -296,7 +300,7 @@ fn compile_item_flags_list() {
         "IGNORECASE".into(),
         "MULTILINE".into(),
     ]));
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     assert!(item.pattern.is_match("info"));
 }
 
@@ -306,7 +310,7 @@ fn compile_item_unknown_flag_rejected() {
     let parts = atom_parts(&["level"], None);
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("BADFLAG".into()));
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms, &[], false).is_err());
 }
 
 #[test]
@@ -315,7 +319,7 @@ fn compile_item_ignore_set_merges_blacklist_and_item() {
     let parts = atom_parts(&["timestamp", "level"], Some(" "));
     let mut raw = raw_item_with_parts("entry", parts);
     raw.ignore_atoms = Some(vec!["level".into()]);
-    let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
+    let item = compile_item(&raw, &atoms, &["timestamp".to_string()], false).unwrap();
     assert!(item.ignore_set.contains(&"timestamp".to_string()));
     assert!(item.ignore_set.contains(&"level".to_string()));
 }
@@ -325,7 +329,7 @@ fn compile_item_duplicate_atom_gets_unique_groups() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level", "level"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     assert_eq!(item.capture_atoms.len(), 2);
     assert_ne!(item.capture_atoms[0].1, item.capture_atoms[1].1);
 }
@@ -494,7 +498,7 @@ fn parse_log_signature_excludes_ignored_atoms() {
     let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let mut raw = raw_item_with_parts("entry", parts);
     raw.ignore_atoms = Some(vec!["timestamp".into()]);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -796,7 +800,7 @@ fn integration_blacklist_ignores_timestamp() {
     let atoms = make_atoms();
     let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
+    let item = compile_item(&raw, &atoms, &["timestamp".to_string()], false).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -962,7 +966,7 @@ fn validate_multiline_item_counted() {
         },
     ];
     let raw = raw_item_with_parts("multiline_entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -1086,7 +1090,7 @@ fn max_span_multiline_pattern() {
         },
     ];
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -1130,12 +1134,12 @@ fn diagnose_best_match_selection_multiple_items() {
     // Item 1: level + " " + message (3 parts)
     let parts1 = atom_parts(&["level", "message"], Some(" "));
     let raw1 = raw_item_with_parts("short_entry", parts1);
-    let item1 = compile_item(&raw1, &atoms, &[]).unwrap();
+    let item1 = compile_item(&raw1, &atoms, &[], false).unwrap();
 
     // Item 2: timestamp + " " + level + " " + message (5 parts)
     let parts2 = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw2 = raw_item_with_parts("full_entry", parts2);
-    let item2 = compile_item(&raw2, &atoms, &[]).unwrap();
+    let item2 = compile_item(&raw2, &atoms, &[], false).unwrap();
 
     let config = Config {
         index_threshold: 0,
@@ -1160,7 +1164,7 @@ fn diagnose_with_flags_ignorecase() {
     let parts = atom_parts(&["level", "message"], Some(" "));
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms, &[], false).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
