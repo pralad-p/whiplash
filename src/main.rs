@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::Deserialize;
 use tracing::{debug, info};
 
@@ -89,12 +89,19 @@ struct RawPart {
 }
 
 // ── Resolved config ──────────────────────────────────────────────────
+struct CaptureGroup {
+    group_name: Box<str>,
+    include_in_sig: bool,
+}
 
 struct Config {
     index_threshold: usize,
     max_failed_items: usize,
     delimiters: Vec<Regex>,
     items: Vec<CompiledItem>,
+    // Fast "which pattern matches" prefilter
+    full_set: Option<RegexSet>,
+    prefix_set: RegexSet,
 }
 
 struct DiagnosticPart {
@@ -104,11 +111,9 @@ struct DiagnosticPart {
 
 struct CompiledItem {
     name: String,
-    pattern: Regex,
-    /// Atom names that participate in this item's captures (in order).
-    capture_atoms: Vec<(String, String)>, // (atom_name, capture_group_name)
-    /// Atoms to ignore in signature.
-    ignore_set: Vec<String>,
+    full: Regex,
+    prefix: Regex,
+    capture_groups: Vec<CaptureGroup>,
     /// Ordered parts for diagnostic output on validation failure.
     diagnostic_parts: Vec<DiagnosticPart>,
     /// Flags prefix e.g. "(?ims)" or "", needed to reconstruct partial patterns.
@@ -144,11 +149,24 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
             .with_context(|| format!("compiling item '{}'", raw_item.name))?;
         compiled_items.push(item);
     }
+    let full_set = if !delimiters.is_empty() && compiled_items.len() > 1 {
+        Some(
+            RegexSet::new(compiled_items.iter().map(|i| i.full.as_str()))
+                .context("failed to build full RegexSet")?,
+        )
+    } else {
+        None
+    };
+
+    let prefix_set = RegexSet::new(compiled_items.iter().map(|i| i.prefix.as_str()))
+        .context("failed to build prefix RegexSet")?;
     Ok(Config {
         index_threshold,
         max_failed_items,
         items: compiled_items,
         delimiters,
+        full_set,
+        prefix_set,
     })
 }
 
@@ -185,8 +203,15 @@ fn compile_item(
         bail!("item '{}': `parts` must be non-empty", raw.name);
     }
 
-    let mut pattern_str = String::new();
-    let mut capture_atoms: Vec<(String, String)> = Vec::new();
+    let mut ignore = std::collections::HashSet::<String>::new();
+    for a in blacklist {
+        ignore.insert(a.clone());
+    }
+    for a in raw.ignore_atoms.iter().flatten() {
+        ignore.insert(a.clone());
+    }
+    let mut body = String::new();
+    let mut capture_groups: Vec<CaptureGroup> = Vec::new();
     let mut ordinal_counter: HashMap<String, usize> = HashMap::new();
     let mut diagnostic_parts: Vec<DiagnosticPart> = Vec::new();
 
@@ -196,29 +221,38 @@ fn compile_item(
                 let atom_regex = atoms
                     .get(atom_name)
                     .with_context(|| format!("atom '{}' not found", atom_name))?;
+
                 let ord = ordinal_counter.entry(atom_name.clone()).or_insert(0);
                 let group_name = format!("{}__{}", atom_name, ord);
                 *ord += 1;
-                capture_atoms.push((atom_name.clone(), group_name.clone()));
+
+                capture_groups.push(CaptureGroup {
+                    group_name: group_name.clone().into_boxed_str(),
+                    include_in_sig: !ignore.contains(atom_name),
+                });
+
                 let core = format!("(?P<{}>{})", group_name, atom_regex);
                 let fragment = if part.optional {
                     format!("(?:{})?", core)
                 } else {
                     core
                 };
-                pattern_str.push_str(&fragment);
+
+                body.push_str(&fragment);
                 diagnostic_parts.push(DiagnosticPart {
                     label: atom_name.clone(),
                     fragment,
                 });
             }
             (None, Some(regex_frag)) => {
+                let frag = format!("(?:{})", regex_frag);
                 let fragment = if part.optional {
-                    format!("(?:{})?", regex_frag)
+                    format!("(?:{})?", frag)
                 } else {
-                    regex_frag.clone()
+                    frag
                 };
-                pattern_str.push_str(&fragment);
+
+                body.push_str(&fragment);
                 diagnostic_parts.push(DiagnosticPart {
                     label: "(joining-regex)".to_string(),
                     fragment: regex_frag.clone(),
@@ -244,26 +278,31 @@ fn compile_item(
     }
 
     let flags_prefix = if !flag_str.is_empty() {
-        let prefix = format!("(?{})", flag_str);
-        pattern_str = format!("{}{}", prefix, pattern_str);
-        prefix
+        format!("(?{})", flag_str)
     } else {
         String::new()
     };
 
-    debug!(item = %raw.name, pattern = %pattern_str, "compiled pattern");
+    let mut full_pat = format!(r"\A(?:{})\z", body);
+    let mut prefix_pat = format!(r"\A(?:{})", body);
 
-    let pattern = Regex::new(&pattern_str)
-        .with_context(|| format!("invalid regex for item '{}'", raw.name))?;
+    if !flags_prefix.is_empty() {
+        full_pat = format!("{}{}", flags_prefix, full_pat);
+        prefix_pat = format!("{}{}", flags_prefix, prefix_pat);
+    }
 
-    let mut ignore_set = blacklist.to_vec();
-    ignore_set.extend(raw.ignore_atoms.iter().flatten().cloned());
+    let full =
+        Regex::new(&full_pat).with_context(|| format!("invalid full regex for '{}'", raw.name))?;
+    let prefix = Regex::new(&prefix_pat)
+        .with_context(|| format!("invalid prefix regex for '{}'", raw.name))?;
+
+    debug!(item = %raw.name, pattern = %body, "compiled pattern");
 
     Ok(CompiledItem {
         name: raw.name.clone(),
-        pattern,
-        capture_atoms,
-        ignore_set,
+        full,
+        prefix,
+        capture_groups,
         diagnostic_parts,
         flags_prefix,
     })
@@ -272,50 +311,109 @@ fn compile_item(
 // ── Parsed item ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct ParsedItem {
+struct Signature<'a> {
+    item_id: usize,
+    values: Vec<&'a str>,
+}
+
+impl<'a, 'b> PartialEq<Signature<'b>> for Signature<'a> {
+    fn eq(&self, other: &Signature<'b>) -> bool {
+        self.item_id == other.item_id
+            && self.values.len() == other.values.len()
+            && self
+                .values
+                .iter()
+                .zip(other.values.iter())
+                .all(|(a, b)| a == b)
+    }
+}
+
+impl<'a> Eq for Signature<'a> {}
+
+#[derive(Debug, Clone)]
+struct ParsedItem<'a> {
     line_no: usize,
-    raw_line: String,
-    #[allow(dead_code)]
-    atom_values: HashMap<String, Vec<String>>,
-    signature: (String, Vec<String>),
+    raw_line: &'a str,
+    sig_hash: u64,
+    signature: Signature<'a>,
 }
 
 // ── Log parsing ──────────────────────────────────────────────────────
+#[inline]
+fn signature_hash(item_id: usize, values: &[&str]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
 
-fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
+    let mut h = FNV_OFFSET;
+    for b in item_id.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    for v in values {
+        for &b in v.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // separator
+        h ^= 0xFF;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+fn parse_log<'a>(content: &'a str, config: &Config) -> (Vec<ParsedItem<'a>>, Vec<usize>) {
     if config.delimiters.is_empty() {
         return parse_log_legacy(content, config); // your old logic but with anchored removed
     }
+    parse_log_delimited(content, config)
+}
 
-    let lines = split_lines_keepends(content);
+fn parse_log_delimited<'a>(content: &'a str, config: &Config) -> (Vec<ParsedItem<'a>>, Vec<usize>) {
     let mut items = Vec::new();
     let mut unparsed_blocks = Vec::new();
 
-    let mut block = String::new();
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+
+    let mut i = 0usize;
+    let mut line_no = 1usize;
+
+    let mut block_start_byte: Option<usize> = None;
     let mut block_start_line: usize = 1;
 
-    for (i, line) in lines.iter().enumerate() {
+    while i < len {
+        let line_start = i;
+        while i < len && bytes[i] != b'\n' {
+            i += 1;
+        }
+        if i < len {
+            i += 1;
+        } // include '\n'
+        let line_end = i;
+
+        let line = &content[line_start..line_end];
         let stripped = line.trim_end_matches(['\n', '\r']);
+
         if is_delimiter_line(stripped, config) {
-            if !block.is_empty() {
-                if let Some(item) = parse_block(&block, block_start_line, config) {
+            if let Some(bs) = block_start_byte.take() {
+                let block = &content[bs..line_start];
+                if let Some(item) = parse_block(block, block_start_line, config) {
                     items.push(item);
                 } else {
                     unparsed_blocks.push(block_start_line);
                 }
-                block.clear();
             }
-            continue;
+        } else if block_start_byte.is_none() {
+            block_start_byte = Some(line_start);
+            block_start_line = line_no;
         }
 
-        if block.is_empty() {
-            block_start_line = i + 1; // 1-based
-        }
-        block.push_str(line);
+        line_no += 1;
     }
 
-    if !block.is_empty() {
-        if let Some(item) = parse_block(&block, block_start_line, config) {
+    if let Some(bs) = block_start_byte {
+        let block = &content[bs..len];
+        if let Some(item) = parse_block(block, block_start_line, config) {
             items.push(item);
         } else {
             unparsed_blocks.push(block_start_line);
@@ -325,103 +423,157 @@ fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
     (items, unparsed_blocks)
 }
 
-fn parse_block(block: &str, start_line_no: usize, config: &Config) -> Option<ParsedItem> {
+fn parse_block<'a>(
+    block: &'a str,
+    start_line_no: usize,
+    config: &Config,
+) -> Option<ParsedItem<'a>> {
     let text = block.trim_end_matches(['\n', '\r']);
-
-    for compiled in &config.items {
-        // Require full-block match:
-        let m = compiled.pattern.find(text)?;
-        if m.start() != 0 || m.end() != text.len() {
-            continue;
-        }
-
-        let caps = compiled.pattern.captures(text)?;
-
-        let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
-        let mut sig_values = Vec::new();
-
-        for (atom_name, group_name) in &compiled.capture_atoms {
-            if let Some(val) = caps.name(group_name) {
-                let val_str = val.as_str().to_string();
-                atom_values
-                    .entry(atom_name.clone())
-                    .or_default()
-                    .push(val_str.clone());
-                if !compiled.ignore_set.contains(atom_name) {
-                    sig_values.push(val_str);
-                }
-            }
-        }
-
-        return Some(ParsedItem {
-            line_no: start_line_no,
-            raw_line: text.to_string(),
-            atom_values,
-            signature: (compiled.name.clone(), sig_values),
-        });
+    if text.is_empty() {
+        return None;
     }
 
-    None
+    let idx = if let Some(set) = &config.full_set {
+        set.matches(text).iter().next()?
+    } else {
+        // small number of items: linear scan
+        config.items.iter().position(|it| it.full.is_match(text))?
+    };
+
+    let item = &config.items[idx];
+    let caps = item.full.captures(text)?;
+
+    let mut values = Vec::with_capacity(item.capture_groups.len());
+    for cg in &item.capture_groups {
+        if cg.include_in_sig {
+            if let Some(m) = caps.name(&cg.group_name) {
+                values.push(m.as_str());
+            }
+        }
+    }
+
+    let signature = Signature {
+        item_id: idx,
+        values,
+    };
+    let sig_hash = signature_hash(signature.item_id, &signature.values);
+
+    Some(ParsedItem {
+        line_no: start_line_no,
+        raw_line: text,
+        sig_hash,
+        signature,
+    })
 }
 
-fn parse_log_legacy(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
-    let lines: Vec<&str> = split_lines_keepends(content);
+#[inline]
+fn consume_n_lines(bytes: &[u8], mut pos: usize, lines: usize) -> usize {
+    let mut seen = 0usize;
+    while pos < bytes.len() && seen < lines {
+        if bytes[pos] == b'\n' {
+            seen += 1;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+fn parse_log_legacy<'a>(content: &'a str, config: &Config) -> (Vec<ParsedItem<'a>>, Vec<usize>) {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+
     let mut items = Vec::new();
     let mut unparsed_lines = Vec::new();
-    let mut pos = 0;
 
-    while pos < lines.len() {
-        let remaining: String = lines[pos..].concat();
-        let mut matched = false;
+    let mut pos = 0usize;
+    let mut line_no = 1usize;
 
-        for compiled in &config.items {
-            if let Some(m) = compiled.pattern.find(&remaining) {
-                // Match must start at the beginning of the remaining text
-                if m.start() != 0 {
-                    continue;
+    while pos < len {
+        let remaining = &content[pos..];
+
+        // Pick the longest match among candidate patterns
+        let candidates = config.prefix_set.matches(remaining);
+        let mut best_idx: Option<usize> = None;
+        let mut best_end: usize = 0;
+
+        for idx in candidates.iter() {
+            let item = &config.items[idx];
+            if let Some(m) = item.prefix.find(remaining) {
+                if m.start() == 0 && m.end() > best_end {
+                    best_end = m.end();
+                    best_idx = Some(idx);
                 }
-
-                // Extract captures
-                let caps = compiled.pattern.captures(&remaining).unwrap();
-                let matched_text = m.as_str();
-
-                // Count how many lines the match spans
-                let lines_spanned = matched_text.lines().count().max(1);
-
-                let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
-                let mut sig_values = Vec::new();
-                for (atom_name, group_name) in &compiled.capture_atoms {
-                    if let Some(val) = caps.name(group_name) {
-                        let val_str = val.as_str().to_string();
-                        atom_values
-                            .entry(atom_name.clone())
-                            .or_default()
-                            .push(val_str.clone());
-                        if !compiled.ignore_set.contains(atom_name) {
-                            sig_values.push(val_str);
-                        }
-                    }
-                }
-
-                let raw_line = matched_text.trim_end_matches(['\n', '\r']).to_string();
-
-                items.push(ParsedItem {
-                    line_no: pos + 1,
-                    raw_line,
-                    atom_values,
-                    signature: (compiled.name.clone(), sig_values),
-                });
-
-                pos += lines_spanned;
-                matched = true;
-                break;
             }
         }
 
-        if !matched {
-            unparsed_lines.push(pos + 1);
-            pos += 1;
+        let Some(idx) = best_idx else {
+            unparsed_lines.push(line_no);
+            if let Some(off) = bytes[pos..].iter().position(|&b| b == b'\n') {
+                pos += off + 1;
+            } else {
+                pos = len;
+            }
+            line_no += 1;
+            continue;
+        };
+
+        let item = &config.items[idx];
+
+        // Run captures only once for the selected regex
+        let Some(caps) = item.prefix.captures(remaining) else {
+            // extremely rare if find() succeeded, but be safe
+            unparsed_lines.push(line_no);
+            if let Some(off) = bytes[pos..].iter().position(|&b| b == b'\n') {
+                pos += off + 1;
+            } else {
+                pos = len;
+            }
+            line_no += 1;
+            continue;
+        };
+
+        let m0 = match caps.get(0) {
+            Some(m) => m,
+            None => {
+                unparsed_lines.push(line_no);
+                if let Some(off) = bytes[pos..].iter().position(|&b| b == b'\n') {
+                    pos += off + 1;
+                } else {
+                    pos = len;
+                }
+                line_no += 1;
+                continue;
+            }
+        };
+
+        let matched = m0.as_str();
+
+        let mut values = Vec::with_capacity(item.capture_groups.len());
+        for cg in &item.capture_groups {
+            if cg.include_in_sig {
+                if let Some(m) = caps.name(&cg.group_name) {
+                    values.push(m.as_str());
+                }
+            }
         }
+
+        let signature = Signature {
+            item_id: idx,
+            values,
+        };
+        let sig_hash = signature_hash(signature.item_id, &signature.values);
+
+        let raw_line = matched.trim_end_matches(['\n', '\r']);
+        items.push(ParsedItem {
+            line_no,
+            raw_line,
+            sig_hash,
+            signature,
+        });
+
+        let span = matched.lines().count().max(1);
+        pos = consume_n_lines(bytes, pos, span);
+        line_no += span;
     }
 
     (items, unparsed_lines)
@@ -471,27 +623,46 @@ struct CompareResult {
     stop_reason: Option<String>,
 }
 
-fn compare(
-    clean_items: &[ParsedItem],
-    dirty_items: &[ParsedItem],
+fn compare<'c, 'd>(
+    clean_items: &[ParsedItem<'c>],
+    dirty_items: &[ParsedItem<'d>],
     threshold: usize,
     max_failed_items: usize,
 ) -> CompareResult {
-    // Phase 1: find matches — scan dirty left-to-right, find closest unmatched clean
+    use std::collections::HashMap;
+
     let mut clean_matched = vec![false; clean_items.len()];
     let mut dirty_to_clean: Vec<Option<usize>> = vec![None; dirty_items.len()];
 
+    // Index clean items by sig_hash -> sorted list of indices
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(clean_items.len() * 2);
+    for (ci, it) in clean_items.iter().enumerate() {
+        index.entry(it.sig_hash).or_default().push(ci);
+    }
+
     for (di, dirty_item) in dirty_items.iter().enumerate() {
+        if clean_items.is_empty() {
+            continue;
+        }
+
         let lo = di.saturating_sub(threshold);
         let hi = (di + threshold).min(clean_items.len().saturating_sub(1));
-
         if lo >= clean_items.len() {
             continue;
         }
 
+        let Some(cands) = index.get(&dirty_item.sig_hash) else {
+            continue;
+        };
+
+        // restrict to candidate indices within [lo, hi]
+        let l = cands.partition_point(|&x| x < lo);
+        let r = cands.partition_point(|&x| x <= hi);
+
         let mut best: Option<usize> = None;
         let mut best_dist: usize = usize::MAX;
-        for ci in lo..=hi {
+
+        for &ci in &cands[l..r] {
             if clean_matched[ci] {
                 continue;
             }
@@ -510,13 +681,13 @@ fn compare(
         }
     }
 
-    // Phase 2: emit events
+    // Phase 2 unchanged (emit events) ...
     let mut events = Vec::new();
     let mut failed_run: usize = 0;
     let mut stopped = false;
     let mut stop_reason: Option<String> = None;
 
-    for (di, _) in dirty_to_clean.iter().enumerate().take(dirty_items.len()) {
+    for (di, _) in dirty_to_clean.iter().enumerate() {
         if let Some(ci) = dirty_to_clean[di] {
             events.push(CompareEvent::Match {
                 clean_idx: ci,
@@ -537,9 +708,8 @@ fn compare(
         }
     }
 
-    // Append Missing for unmatched clean items (skip if stopped)
     if !stopped {
-        for (ci, _) in clean_matched.iter().enumerate().take(clean_items.len()) {
+        for (ci, _) in clean_matched.iter().enumerate() {
             if !clean_matched[ci] {
                 events.push(CompareEvent::Missing { clean_idx: ci });
             }
@@ -555,7 +725,11 @@ fn compare(
 
 // ── Output ───────────────────────────────────────────────────────────
 
-fn print_output(result: &CompareResult, clean_items: &[ParsedItem], dirty_items: &[ParsedItem]) {
+fn print_output<'c, 'd>(
+    result: &CompareResult,
+    clean_items: &[ParsedItem<'c>],
+    dirty_items: &[ParsedItem<'d>],
+) {
     for event in &result.events {
         match event {
             CompareEvent::Match { dirty_idx, .. } => {
@@ -639,7 +813,7 @@ fn max_pattern_line_span(config: &Config) -> usize {
         .items
         .iter()
         .map(|item| {
-            let bytes = item.pattern.as_str().as_bytes();
+            let bytes = item.prefix.as_str().as_bytes();
             let newline_escapes = bytes
                 .windows(2)
                 .filter(|w| w[0] == b'\\' && w[1] == b'n')
@@ -846,11 +1020,7 @@ fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult>
 
 fn block_matches_any_item(block: &str, config: &Config) -> bool {
     let text = block.trim_end_matches(['\n', '\r']);
-    config.items.iter().any(|item| {
-        item.pattern
-            .find(text)
-            .is_some_and(|m| m.start() == 0 && m.end() == text.len())
-    })
+    config.items.iter().any(|item| item.full.is_match(text))
 }
 
 /// Stream-based validation: reads from any `BufRead` source line by line,
@@ -887,31 +1057,39 @@ fn validate_legacy(mut reader: impl BufRead, config: &Config) -> Result<Validate
                 break;
             }
             let mut matched = false;
-            for compiled in &config.items {
-                if let Some(m) = compiled.pattern.find(&buf) {
-                    if m.start() != 0 {
-                        continue;
+            let candidates = config.prefix_set.matches(&buf);
+
+            let mut best_end: usize = 0;
+            let mut best_idx: Option<usize> = None;
+
+            for idx in candidates.iter() {
+                let compiled = &config.items[idx];
+                if let Some(m) = compiled.prefix.find(&buf) {
+                    if m.start() == 0 && m.end() > best_end {
+                        best_end = m.end();
+                        best_idx = Some(idx);
                     }
-
-                    let span = m.as_str().lines().count().max(1);
-
-                    // Advance past the complete matched lines
-                    let mut consumed = 0;
-                    let mut counted = 0;
-                    let bytes = buf.as_bytes();
-                    while counted < span && consumed < bytes.len() {
-                        if bytes[consumed] == b'\n' {
-                            counted += 1;
-                        }
-                        consumed += 1;
-                    }
-
-                    buf.drain(..consumed);
-                    line_no += span;
-                    processed += 1;
-                    matched = true;
-                    break;
                 }
+            }
+            if let Some(idx) = best_idx {
+                let m = config.items[idx].prefix.find(&buf).unwrap();
+                let span = m.as_str().lines().count().max(1);
+
+                // Advance past the complete matched lines
+                let mut consumed = 0;
+                let mut counted = 0;
+                let bytes = buf.as_bytes();
+                while counted < span && consumed < bytes.len() {
+                    if bytes[consumed] == b'\n' {
+                        counted += 1;
+                    }
+                    consumed += 1;
+                }
+
+                buf.drain(..consumed);
+                line_no += span;
+                processed += 1;
+                matched = true;
             }
             if !matched {
                 break;

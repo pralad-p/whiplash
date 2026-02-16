@@ -2,6 +2,24 @@ use super::*;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+fn mk_config(items: Vec<CompiledItem>, delimiters: Vec<Regex>) -> Config {
+    let full_set = if !delimiters.is_empty() && items.len() > 1 {
+        Some(RegexSet::new(items.iter().map(|i| i.full.as_str())).unwrap())
+    } else {
+        None
+    };
+    let prefix_set = RegexSet::new(items.iter().map(|i| i.prefix.as_str())).unwrap();
+
+    Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        delimiters,
+        items,
+        full_set,
+        prefix_set,
+    }
+}
+
 fn make_atoms() -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert(
@@ -48,29 +66,49 @@ fn simple_config() -> Config {
     let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw = raw_item_with_parts("log_entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![], // legacy mode
-        items: vec![item],
-    }
+    mk_config(vec![item], vec![]) // legacy mode
 }
 
 fn simple_delimited_config(delim_pat: &str) -> Config {
-    let mut cfg = simple_config();
-    cfg.delimiters = vec![Regex::new(delim_pat).unwrap()];
-    cfg
+    let atoms = make_atoms();
+    let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
+    let raw = raw_item_with_parts("log_entry", parts);
+    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    mk_config(vec![item], vec![Regex::new(delim_pat).unwrap()])
 }
 
-fn make_parsed_item(name: &str, line_no: usize, raw_line: &str, sig_vals: Vec<&str>) -> ParsedItem {
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+fn item_id_for(name: &str) -> usize {
+    match name {
+        "entry" => 0,
+        "e" => 1,
+        _ => 2,
+    }
+}
+
+fn make_parsed_item(
+    name: &str,
+    line_no: usize,
+    raw_line: String,
+    sig_vals: Vec<String>,
+) -> ParsedItem<'static> {
+    let raw_line = leak(raw_line);
+    let values: Vec<&'static str> = sig_vals.into_iter().map(leak).collect();
+
+    let signature = Signature {
+        item_id: item_id_for(name),
+        values,
+    };
+    let sig_hash = signature_hash(signature.item_id, &signature.values);
+
     ParsedItem {
         line_no,
-        raw_line: raw_line.into(),
-        atom_values: HashMap::new(),
-        signature: (
-            name.into(),
-            sig_vals.into_iter().map(String::from).collect(),
-        ),
+        raw_line,
+        sig_hash,
+        signature,
     }
 }
 
@@ -188,8 +226,8 @@ fn compile_item_with_parts_atom_and_regex() {
     ];
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    assert!(item.pattern.is_match("INFO: hello world"));
-    assert!(!item.pattern.is_match("INFO hello world"));
+    assert!(item.full.is_match("INFO: hello world"));
+    assert!(!item.full.is_match("INFO hello world"));
 }
 
 #[test]
@@ -199,7 +237,7 @@ fn compile_item_with_wildcard_regex_between_atoms() {
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
     assert_eq!(item.name, "entry");
-    assert!(item.pattern.is_match("INFO something happened"));
+    assert!(item.full.is_match("INFO something happened"));
 }
 
 #[test]
@@ -208,9 +246,9 @@ fn compile_item_with_space_regex_between_atoms() {
     let parts = atom_parts(&["level", "message"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    assert!(item.pattern.is_match("ERROR crash"));
+    assert!(item.full.is_match("ERROR crash"));
     // Joiner is literal space, so "ERROR\tcrash" should not match (tab instead of space)
-    assert!(!item.pattern.is_match("ERROR\tcrash"));
+    assert!(!item.full.is_match("ERROR\tcrash"));
 }
 
 #[test]
@@ -283,8 +321,8 @@ fn compile_item_flags_ignorecase() {
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    assert!(item.pattern.is_match("info"));
-    assert!(item.pattern.is_match("INFO"));
+    assert!(item.full.is_match("info"));
+    assert!(item.full.is_match("INFO"));
 }
 
 #[test]
@@ -297,7 +335,7 @@ fn compile_item_flags_list() {
         "MULTILINE".into(),
     ]));
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    assert!(item.pattern.is_match("info"));
+    assert!(item.full.is_match("info"));
 }
 
 #[test]
@@ -315,9 +353,13 @@ fn compile_item_ignore_set_merges_blacklist_and_item() {
     let parts = atom_parts(&["timestamp", "level"], Some(" "));
     let mut raw = raw_item_with_parts("entry", parts);
     raw.ignore_atoms = Some(vec!["level".into()]);
+
     let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
-    assert!(item.ignore_set.contains(&"timestamp".to_string()));
-    assert!(item.ignore_set.contains(&"level".to_string()));
+
+    // capture_groups are in atom order: timestamp, then level
+    assert_eq!(item.capture_groups.len(), 2);
+    assert!(!item.capture_groups[0].include_in_sig); // timestamp blacklisted
+    assert!(!item.capture_groups[1].include_in_sig); // level ignored by item
 }
 
 #[test]
@@ -326,8 +368,12 @@ fn compile_item_duplicate_atom_gets_unique_groups() {
     let parts = atom_parts(&["level", "level"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    assert_eq!(item.capture_atoms.len(), 2);
-    assert_ne!(item.capture_atoms[0].1, item.capture_atoms[1].1);
+
+    assert_eq!(item.capture_groups.len(), 2);
+    assert_ne!(
+        item.capture_groups[0].group_name.as_ref(),
+        item.capture_groups[1].group_name.as_ref()
+    );
 }
 
 // ── Config TOML parsing ──────────────────────────────────────────────
@@ -483,9 +529,9 @@ fn parse_log_unparsed_lines() {
 fn parse_log_signature_includes_all_atoms() {
     let config = simple_config();
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
-    let (ref name, ref vals) = items[0].signature;
-    assert_eq!(name, "log_entry");
-    assert_eq!(vals.len(), 3); // timestamp, level, message
+    let sig = &items[0].signature;
+    assert_eq!(config.items[sig.item_id].name, "log_entry");
+    assert_eq!(sig.values.len(), 3);
 }
 
 #[test]
@@ -495,26 +541,11 @@ fn parse_log_signature_excludes_ignored_atoms() {
     let mut raw = raw_item_with_parts("entry", parts);
     raw.ignore_atoms = Some(vec!["timestamp".into()]);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item],
-    };
+    let config = mk_config(vec![item], vec![]);
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
-    let (_, ref vals) = items[0].signature;
-    assert_eq!(vals.len(), 2); // level, message only
-    assert_eq!(vals[0], "INFO");
-}
-
-#[test]
-fn parse_log_atom_values_populated() {
-    let config = simple_config();
-    let (items, _) = parse_log("2024-01-01 10:00:00 ERROR boom\n", &config);
-    assert_eq!(
-        items[0].atom_values.get("level").unwrap(),
-        &vec!["ERROR".to_string()]
-    );
+    let sig = &items[0].signature;
+    assert_eq!(sig.values.len(), 2);
+    assert_eq!(sig.values[0], "INFO");
 }
 
 #[test]
@@ -562,7 +593,9 @@ fn parse_log_with_delimiters_unparsed_block_records_start_line() {
 
 #[test]
 fn compare_empty_inputs() {
-    let result = compare(&[], &[], 0, 0);
+    let clean: Vec<ParsedItem<'static>> = vec![];
+    let dirty: Vec<ParsedItem<'static>> = vec![];
+    let result = compare(&clean, &dirty, 0, 0);
     assert!(result.events.is_empty());
     assert!(!result.stopped);
 }
@@ -570,7 +603,7 @@ fn compare_empty_inputs() {
 #[test]
 fn compare_identical_items() {
     let items: Vec<ParsedItem> = (0..3)
-        .map(|i| make_parsed_item("entry", i + 1, &format!("line {}", i), vec!["A"]))
+        .map(|i| make_parsed_item("entry", i + 1, format!("line {}", i), vec!["A".to_string()]))
         .collect();
     let result = compare(&items, &items, 0, 0);
     let (m, ex, mi) = count_events(&result);
@@ -582,8 +615,18 @@ fn compare_identical_items() {
 
 #[test]
 fn compare_all_different() {
-    let clean = vec![make_parsed_item("entry", 1, "a", vec!["A"])];
-    let dirty = vec![make_parsed_item("entry", 1, "b", vec!["B"])];
+    let clean = vec![make_parsed_item(
+        "entry",
+        1,
+        "a".to_string(),
+        vec!["A".to_string()],
+    )];
+    let dirty = vec![make_parsed_item(
+        "entry",
+        1,
+        "b".to_string(),
+        vec!["B".to_string()],
+    )];
     let result = compare(&clean, &dirty, 0, 0);
     let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 0);
@@ -593,10 +636,15 @@ fn compare_all_different() {
 
 #[test]
 fn compare_dirty_has_extra_items() {
-    let clean = vec![make_parsed_item("e", 1, "a", vec!["A"])];
+    let clean = vec![make_parsed_item(
+        "e",
+        1,
+        "a".to_string(),
+        vec!["A".to_string()],
+    )];
     let dirty = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
     let result = compare(&clean, &dirty, 0, 0);
     let (m, ex, mi) = count_events(&result);
@@ -608,10 +656,15 @@ fn compare_dirty_has_extra_items() {
 #[test]
 fn compare_clean_has_more_items() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
-    let dirty = vec![make_parsed_item("e", 1, "a", vec!["A"])];
+    let dirty = vec![make_parsed_item(
+        "e",
+        1,
+        "a".to_string(),
+        vec!["A".to_string()],
+    )];
     let result = compare(&clean, &dirty, 0, 0);
     let (m, ex, mi) = count_events(&result);
     assert_eq!(m, 1);
@@ -622,13 +675,13 @@ fn compare_clean_has_more_items() {
 #[test]
 fn compare_threshold_allows_offset_match() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
     let dirty = vec![
-        make_parsed_item("e", 1, "x", vec!["X"]),
-        make_parsed_item("e", 2, "a", vec!["A"]),
-        make_parsed_item("e", 3, "b", vec!["B"]),
+        make_parsed_item("e", 1, "x".to_string(), vec!["X".to_string()]),
+        make_parsed_item("e", 2, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 3, "b".to_string(), vec!["B".to_string()]),
     ];
     let result = compare(&clean, &dirty, 1, 0);
     let (m, ex, mi) = count_events(&result);
@@ -640,13 +693,13 @@ fn compare_threshold_allows_offset_match() {
 #[test]
 fn compare_threshold_zero_strict() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
     // Dirty has them swapped
     let dirty = vec![
-        make_parsed_item("e", 1, "b", vec!["B"]),
-        make_parsed_item("e", 2, "a", vec!["A"]),
+        make_parsed_item("e", 1, "b".to_string(), vec!["B".to_string()]),
+        make_parsed_item("e", 2, "a".to_string(), vec!["A".to_string()]),
     ];
     let result = compare(&clean, &dirty, 0, 0);
     let (m, ex, mi) = count_events(&result);
@@ -659,10 +712,10 @@ fn compare_threshold_zero_strict() {
 #[test]
 fn compare_early_stop() {
     let clean: Vec<ParsedItem> = (0..5)
-        .map(|i| make_parsed_item("e", i + 1, &format!("c{}", i), vec![&format!("C{}", i)]))
+        .map(|i| make_parsed_item("e", i + 1, format!("c{}", i), vec![format!("C{}", i)]))
         .collect();
     let dirty: Vec<ParsedItem> = (0..5)
-        .map(|i| make_parsed_item("e", i + 1, &format!("d{}", i), vec![&format!("D{}", i)]))
+        .map(|i| make_parsed_item("e", i + 1, format!("d{}", i), vec![format!("D{}", i)]))
         .collect();
     let result = compare(&clean, &dirty, 0, 2);
     assert!(result.stopped);
@@ -677,14 +730,14 @@ fn compare_early_stop() {
 #[test]
 fn compare_early_stop_disabled_with_zero() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
-        make_parsed_item("e", 3, "c", vec!["C"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
+        make_parsed_item("e", 3, "c".to_string(), vec!["C".to_string()]),
     ];
     let dirty = vec![
-        make_parsed_item("e", 1, "x", vec!["X"]),
-        make_parsed_item("e", 2, "y", vec!["Y"]),
-        make_parsed_item("e", 3, "z", vec!["Z"]),
+        make_parsed_item("e", 1, "x".to_string(), vec!["X".to_string()]),
+        make_parsed_item("e", 2, "y".to_string(), vec!["Y".to_string()]),
+        make_parsed_item("e", 3, "z".to_string(), vec!["Z".to_string()]),
     ];
     let result = compare(&clean, &dirty, 0, 0);
     assert!(!result.stopped);
@@ -696,16 +749,16 @@ fn compare_early_stop_disabled_with_zero() {
 #[test]
 fn compare_failed_run_resets_on_match() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
-        make_parsed_item("e", 3, "c", vec!["C"]),
-        make_parsed_item("e", 4, "d", vec!["D"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
+        make_parsed_item("e", 3, "c".to_string(), vec!["C".to_string()]),
+        make_parsed_item("e", 4, "d".to_string(), vec!["D".to_string()]),
     ];
     let dirty = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]), // matches clean[0], reset
-        make_parsed_item("e", 2, "x", vec!["X"]), // extra, fail=1
-        make_parsed_item("e", 3, "c", vec!["C"]), // matches clean[2], reset
-        make_parsed_item("e", 4, "d", vec!["D"]), // matches clean[3]
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]), // matches clean[0], reset
+        make_parsed_item("e", 2, "x".to_string(), vec!["X".to_string()]), // extra, fail=1
+        make_parsed_item("e", 3, "c".to_string(), vec!["C".to_string()]), // matches clean[2], reset
+        make_parsed_item("e", 4, "d".to_string(), vec!["D".to_string()]), // matches clean[3]
     ];
     let result = compare(&clean, &dirty, 0, 10);
     assert!(!result.stopped);
@@ -717,10 +770,15 @@ fn compare_failed_run_resets_on_match() {
 
 #[test]
 fn compare_dirty_extras_before_match() {
-    let clean = vec![make_parsed_item("e", 1, "b", vec!["B"])];
+    let clean = vec![make_parsed_item(
+        "e",
+        1,
+        "b".to_string(),
+        vec!["B".to_string()],
+    )];
     let dirty = vec![
-        make_parsed_item("e", 1, "x", vec!["X"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "x".to_string(), vec!["X".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
     let result = compare(&clean, &dirty, 1, 0);
     let (m, ex, mi) = count_events(&result);
@@ -732,8 +790,8 @@ fn compare_dirty_extras_before_match() {
 #[test]
 fn compare_dirty_empty() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
     let dirty = vec![]; // no dirty items at all
     let result = compare(&clean, &dirty, 0, 0);
@@ -746,12 +804,12 @@ fn compare_dirty_empty() {
 #[test]
 fn compare_threshold_handles_swap() {
     let clean = vec![
-        make_parsed_item("e", 1, "a", vec!["A"]),
-        make_parsed_item("e", 2, "b", vec!["B"]),
+        make_parsed_item("e", 1, "a".to_string(), vec!["A".to_string()]),
+        make_parsed_item("e", 2, "b".to_string(), vec!["B".to_string()]),
     ];
     let dirty = vec![
-        make_parsed_item("e", 1, "b", vec!["B"]),
-        make_parsed_item("e", 2, "a", vec!["A"]),
+        make_parsed_item("e", 1, "b".to_string(), vec!["B".to_string()]),
+        make_parsed_item("e", 2, "a".to_string(), vec!["A".to_string()]),
     ];
     let result = compare(&clean, &dirty, 1, 0);
     let (m, ex, mi) = count_events(&result);
@@ -797,12 +855,7 @@ fn integration_blacklist_ignores_timestamp() {
     let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item],
-    };
+    let config = mk_config(vec![item], vec![]);
     let clean_log = "2024-01-01 10:00:00 INFO hello\n";
     let dirty_log = "2099-12-31 23:59:59 INFO hello\n";
     let (clean, _) = parse_log(clean_log, &config);
@@ -963,12 +1016,7 @@ fn validate_multiline_item_counted() {
     ];
     let raw = raw_item_with_parts("multiline_entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item],
-    };
+    let config = mk_config(vec![item], vec![]);
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
     let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
@@ -1087,12 +1135,7 @@ fn max_span_multiline_pattern() {
     ];
     let raw = raw_item_with_parts("entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item],
-    };
+    let config = mk_config(vec![item], vec![]);
     assert_eq!(max_pattern_line_span(&config), 2);
 }
 
@@ -1137,12 +1180,7 @@ fn diagnose_best_match_selection_multiple_items() {
     let raw2 = raw_item_with_parts("full_entry", parts2);
     let item2 = compile_item(&raw2, &atoms, &[]).unwrap();
 
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item1, item2],
-    };
+    let config = mk_config(vec![item1, item2], vec![]);
 
     // Content: timestamp and space match in full_entry, but level fails
     // short_entry: level fails immediately (0 parts)
@@ -1161,12 +1199,7 @@ fn diagnose_with_flags_ignorecase() {
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
     let item = compile_item(&raw, &atoms, &[]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item],
-    };
+    let config = mk_config(vec![item], vec![]);
 
     // With IGNORECASE, "info" should match the level atom
     let content = "info hello\n";
