@@ -653,12 +653,18 @@ fn max_pattern_line_span(config: &Config) -> usize {
 /// Diagnose why no pattern matched `content` by progressively testing
 /// longer prefixes of each item's pattern. Returns a formatted string
 /// showing the best partial match and where it broke.
+struct FailedPart {
+    label: String,
+    pattern: String,
+    got: String,
+}
+
 fn diagnose_mismatch(content: &str, config: &Config) -> String {
     let mut best_item_name = "";
     let mut best_total_parts = 0;
     let mut best_matched_count: Option<usize> = None;
     let mut best_matched_labels: Vec<(String, Option<String>)> = Vec::new(); // (label, captured_value)
-    let mut best_failed_label: Option<String> = None;
+    let mut best_failed: Option<FailedPart> = None;
     let mut best_remaining_count = 0;
 
     for item in &config.items {
@@ -666,7 +672,8 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
         let total = parts.len();
         let mut matched_count: usize = 0;
         let mut matched_labels: Vec<(String, Option<String>)> = Vec::new();
-        let mut failed_label: Option<String> = None;
+        let mut failed: Option<FailedPart> = None;
+        let mut last_match_end: usize = 0;
 
         for i in 0..total {
             // Build prefix pattern from parts[0..=i]
@@ -677,13 +684,21 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
 
             // Try to compile and match at the start of content
             let Ok(re) = Regex::new(&prefix_pattern) else {
-                failed_label = Some(parts[i].label.clone());
+                failed = Some(FailedPart {
+                    label: parts[i].label.clone(),
+                    pattern: parts[i].fragment.clone(),
+                    got: snippet(content, last_match_end),
+                });
                 break;
             };
 
             if let Some(m) = re.find(content) {
                 if m.start() != 0 {
-                    failed_label = Some(parts[i].label.clone());
+                    failed = Some(FailedPart {
+                        label: parts[i].label.clone(),
+                        pattern: parts[i].fragment.clone(),
+                        got: snippet(content, last_match_end),
+                    });
                     break;
                 }
                 // This prefix matched — extract capture value if it's an atom part
@@ -697,8 +712,13 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
                 };
                 matched_labels.push((parts[i].label.clone(), captured));
                 matched_count = i + 1;
+                last_match_end = m.end();
             } else {
-                failed_label = Some(parts[i].label.clone());
+                failed = Some(FailedPart {
+                    label: parts[i].label.clone(),
+                    pattern: parts[i].fragment.clone(),
+                    got: snippet(content, last_match_end),
+                });
                 break;
             }
         }
@@ -714,10 +734,10 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
             best_total_parts = total;
             best_matched_count = Some(matched_count);
             best_matched_labels = matched_labels;
-            best_failed_label = failed_label;
+            best_failed = failed;
             best_remaining_count = total
                 .saturating_sub(matched_count)
-                .saturating_sub(if best_failed_label.is_some() { 1 } else { 0 });
+                .saturating_sub(if best_failed.is_some() { 1 } else { 0 });
         }
     }
 
@@ -741,8 +761,10 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
         }
     }
 
-    if let Some(ref label) = best_failed_label {
-        out.push_str(&format!("    {:40} [no match]\n", label));
+    if let Some(ref f) = best_failed {
+        out.push_str(&format!("    {:40} [no match]\n", f.label));
+        out.push_str(&format!("      pattern: {}\n", f.pattern));
+        out.push_str(&format!("      got:     \"{}\"\n", f.got));
     }
 
     if best_remaining_count > 0 {
@@ -750,6 +772,27 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
     }
 
     out
+}
+
+/// Extract a short snippet of text starting at `offset`, for diagnostic display.
+/// Truncates to 60 chars and escapes newlines for readability.
+fn snippet(content: &str, offset: usize) -> String {
+    let remaining = &content[offset..];
+    let max_len = 60;
+    let truncated = if remaining.len() > max_len {
+        &remaining[..max_len]
+    } else {
+        remaining
+    };
+    let escaped = truncated
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    if remaining.len() > max_len {
+        format!("{}...", escaped)
+    } else {
+        escaped
+    }
 }
 
 fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult> {

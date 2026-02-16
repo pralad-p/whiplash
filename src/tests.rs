@@ -1176,6 +1176,52 @@ fn diagnose_with_flags_ignorecase() {
 }
 
 #[test]
+fn diagnose_partial_match_shows_pattern_and_got() {
+    let config = simple_config();
+    // timestamp matches, space matches, but "BADLEVEL" doesn't match level atom
+    let content = "2024-01-01 10:00:00 BADLEVEL hello\n";
+    let diag = diagnose_mismatch(content, &config);
+    // Should show the failed part's regex pattern
+    assert!(diag.contains("pattern:"));
+    assert!(diag.contains("INFO|WARN|ERROR"));
+    // Should show what the input actually had at the failure point
+    assert!(diag.contains("got:"));
+    assert!(diag.contains("BADLEVEL"));
+}
+
+#[test]
+fn diagnose_no_match_shows_pattern_and_got_from_start() {
+    let config = simple_config();
+    let content = "completely random garbage\n";
+    let diag = diagnose_mismatch(content, &config);
+    // First part (timestamp) fails — got should show text from position 0
+    assert!(diag.contains("pattern:"));
+    assert!(diag.contains("got:"));
+    assert!(diag.contains("completely random garbage"));
+}
+
+#[test]
+fn diagnose_got_escapes_newlines() {
+    let config = simple_config();
+    let content = "2024-01-01 10:00:00 BADLEVEL hello\nmore stuff\n";
+    let diag = diagnose_mismatch(content, &config);
+    // The got snippet should escape the newline for readability
+    assert!(diag.contains("got:"));
+    assert!(diag.contains("BADLEVEL hello\\n"));
+}
+
+#[test]
+fn diagnose_got_truncates_long_content() {
+    let config = simple_config();
+    // Generate content where the failing part has more than 60 chars remaining
+    let long_garbage = "X".repeat(80);
+    let content = format!("2024-01-01 10:00:00 {}\n", long_garbage);
+    let diag = diagnose_mismatch(&content, &config);
+    assert!(diag.contains("got:"));
+    assert!(diag.contains("..."));
+}
+
+#[test]
 fn validate_diagnostic_in_error_output() {
     let config = simple_config();
     let log = "2024-01-01 10:00:00 BADLEVEL hello\n";
