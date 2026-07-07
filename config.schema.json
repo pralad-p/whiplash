@@ -28,6 +28,16 @@
           "description": "Atom names whose extracted values are excluded from matching signatures for all items.",
           "type": "array",
           "items": { "type": "string" }
+        },
+        "delimiters": {
+          "description": "Regex(es) identifying delimiter lines that split the log into blocks; an item pattern must match a whole block. Without delimiters, every line is its own block.",
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          ]
         }
       }
     },
@@ -70,14 +80,14 @@
                 "regex": {
                   "description": "Raw regex fragment.",
                   "type": "string"
+                },
+                "optional": {
+                  "description": "If true, this part may be absent from the log entry.",
+                  "type": "boolean",
+                  "default": false
                 }
               }
             }
-          },
-          "anchored": {
-            "description": "If true, a match must end on a line boundary.",
-            "type": "boolean",
-            "default": false
           },
           "flags": {
             "description": "Regex flags: IGNORECASE, MULTILINE, DOTALL.",
