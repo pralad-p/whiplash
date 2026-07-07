@@ -51,7 +51,7 @@ fn simple_config() -> Config {
     Config {
         index_threshold: 0,
         max_failed_items: 0,
-        delimiters: vec![], // legacy mode
+        delimiters: vec![], // per-line mode: each line is its own block
         items: vec![item],
     }
 }
@@ -86,33 +86,6 @@ fn count_events(result: &CompareResult) -> (usize, usize, usize) {
         }
     }
     (matches, extras, missing)
-}
-
-// ── split_lines_keepends ─────────────────────────────────────────────
-
-#[test]
-fn split_lines_empty() {
-    assert_eq!(split_lines_keepends(""), Vec::<&str>::new());
-}
-
-#[test]
-fn split_lines_single_no_newline() {
-    assert_eq!(split_lines_keepends("hello"), vec!["hello"]);
-}
-
-#[test]
-fn split_lines_single_with_newline() {
-    assert_eq!(split_lines_keepends("hello\n"), vec!["hello\n"]);
-}
-
-#[test]
-fn split_lines_multiple() {
-    assert_eq!(split_lines_keepends("a\nb\nc\n"), vec!["a\n", "b\n", "c\n"]);
-}
-
-#[test]
-fn split_lines_trailing_no_newline() {
-    assert_eq!(split_lines_keepends("a\nb\nc"), vec!["a\n", "b\n", "c"]);
 }
 
 // ── Delimiters (general.delimiters + compile_delimiters) ────────────
@@ -963,10 +936,12 @@ fn validate_multiline_item_counted() {
     ];
     let raw = raw_item_with_parts("multiline_entry", parts);
     let item = compile_item(&raw, &atoms, &[]).unwrap();
+    // Multi-line items require delimiter mode; without delimiter lines in
+    // the log the whole input is a single block.
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
-        delimiters: vec![],
+        delimiters: vec![Regex::new(r"^---$").unwrap()],
         items: vec![item],
     };
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
@@ -1055,45 +1030,6 @@ fn validate_with_delimiters_delimiter_at_start_sets_block_line_numbers() {
     let result = validate(log.as_bytes(), &config).unwrap();
     assert!(result.error.is_none());
     assert!(result.output.contains("Processed 1 items"));
-}
-
-// ── max_pattern_line_span ────────────────────────────────────────────
-
-#[test]
-fn max_span_single_line_patterns() {
-    let config = simple_config();
-    assert_eq!(max_pattern_line_span(&config), 1);
-}
-
-#[test]
-fn max_span_multiline_pattern() {
-    let atoms = make_atoms();
-    let parts = vec![
-        RawPart {
-            atom: Some("level".into()),
-            regex: None,
-            ..Default::default()
-        },
-        RawPart {
-            atom: None,
-            regex: Some(r"\n".into()),
-            ..Default::default()
-        },
-        RawPart {
-            atom: Some("message".into()),
-            regex: None,
-            ..Default::default()
-        },
-    ];
-    let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        items: vec![item],
-    };
-    assert_eq!(max_pattern_line_span(&config), 2);
 }
 
 // ── diagnose_mismatch ────────────────────────────────────────────────

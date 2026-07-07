@@ -25,6 +25,9 @@ Whiplash compares two log files (“clean” and “dirty”) by parsing them in
   - Maximum number of consecutive failures before stopping. `0` disables early stop.
 - `blacklist_atoms` (list of strings, optional)
   - Atom names whose extracted values are excluded from matching signatures for all items.
+- `delimiters` (string or list of strings, optional)
+  - Regex(es) identifying delimiter lines that split the log into blocks.
+  - Without delimiters, every line is its own block (per-line records).
 
 ### `atoms`
 - A map of atom names to regex strings.
@@ -47,8 +50,6 @@ Pattern definition:
 - `parts` are concatenated in order to form the full regex.
 
 #### Additional item fields
-- `anchored` (bool, default `false`)
-  - If true, a match must end on a line boundary (i.e., end of line or end of text).
 - `flags` (string or list of strings, optional)
   - Regex flags by name: `IGNORECASE`, `MULTILINE`, `DOTALL`.
 - `ignore_atoms` (list of strings, optional)
@@ -63,13 +64,11 @@ For each item:
 
 ## Parsing Logs
 - Input logs are read as UTF-8; invalid byte sequences are replaced rather than failing.
-- Logs are split into lines with `keepends=True` to preserve boundaries.
-- Parsing proceeds sequentially through the file:
-  - For each position, the parser tries item patterns in config order.
-  - Matching is attempted from the current offset in the remaining substring.
-  - The first pattern that matches (and passes anchor rules) wins.
-  - If the match spans multiple lines, the parser advances by the number of lines spanned.
-  - If no pattern matches at the current line, that line is recorded as unparsed.
+- The log is split into blocks:
+  - With `general.delimiters` configured, blocks are separated by lines matching a delimiter regex (the delimiter lines themselves are discarded). Blocks may span multiple lines.
+  - Without delimiters, every line is its own block.
+- For each block, item patterns are tried in config order; the first pattern that matches the **entire block** (start to end, trailing newlines excluded) wins.
+- If no pattern fully matches a block, the block's starting line is recorded as unparsed. Partial matches are never accepted.
 
 ### Parsed Item Structure
 For each matched item:
@@ -91,48 +90,37 @@ Core behavior:
 - A match occurs when `clean.signature == dirty.signature` within the window.
 
 Failures and extras:
-- If no candidate window exists: record a mismatch (`"no candidate within threshold"`).
-- If no match found within the window: record a mismatch (`"no match within window"`).
-- If dirty items appear before the matched dirty index, they are recorded as `dirty_extras`.
-- Any remaining dirty items after clean processing are recorded as `dirty_extras`.
+- A dirty item with no match in its window is emitted as an `Extra` event.
+- A clean item left unmatched after all dirty items are processed is emitted as a `Missing` event (skipped if comparison stopped early).
 
 Early stop:
-- `failed_run` counts consecutive failures.
-- Failures include mismatches and dirty-only extras added before a match.
-- If `max_failed_items > 0` and `failed_run >= max_failed_items`, comparison stops early.
-- The result records `stopped`, `stop_clean_index`, `stop_dirty_index`, and a reason.
+- `failed_run` counts consecutive `Extra` events, resetting to `0` on each `Match`.
+- If `max_failed_items > 0` and `failed_run >= max_failed_items`, comparison stops immediately (no further events emitted, and `Missing` events are not appended).
+- The result records `stopped` and a `stop_reason` string.
 
 ## CLI Behavior
 Command:
 ```
-whiplash --config config.toml [--threshold N] [--max-failed N] [--format text|json] [--max-report N] clean.log dirty.log
+whiplash --config config.toml [--threshold N] [--max-failed N] [--validate] clean_log [dirty_log]
 ```
 
 Arguments:
-- Positional: `clean_log`, `dirty_log` (paths)
+- Positional: `clean_log` (required), `dirty_log` (required unless `--validate` is set)
 - Required: `--config` (path to TOML)
-- Optional overrides:
+- Optional:
   - `--threshold` (overrides `general.index_threshold`)
   - `--max-failed` (overrides `general.max_failed_items`)
-  - `--format` (`text` default, or `json`)
-  - `--max-report` (text output limit, default `20`)
+  - `--validate` (validate `clean_log` against the config instead of comparing two logs)
 
-Validation:
-- `--threshold` and `--max-failed` must be >= 0 (otherwise exit with error).
+## Output
 
-## Output Formats
+### Comparison (`clean_log` and `dirty_log` given)
+- Prints each dirty item's `raw_line` in order for every `Match` event.
+- On the first `Extra` or `Missing` event, prints `--- DIVERGENCE ---` followed by a one-line description (dirty line and line number, or clean line and line number) and stops.
+- If comparison stopped early with no divergence printed, prints `--- STOPPED ---` followed by the stop reason.
 
-### Text
-- Summary counts:
-  - clean items, dirty items, matches, mismatches, dirty-only extras,
-    unparsed clean lines, unparsed dirty lines.
-- Early stop status and details.
-- Lists of first mismatches and dirty-only extras (limited by `--max-report`).
-
-### JSON
-- `summary`: same counts and early stop metadata as text.
-- `mismatches`: list with clean index, line, item name, and reason.
-- `dirty_extras`: list with dirty line and item name.
+### `--validate`
+- Prints `Processed N items` followed by either `Config.toml correct 🟢`, or on the first block with no matching pattern: the validation error, a diagnostic breakdown of the closest-matching item's parts, and `Validation failed, issue with Config.toml 🔴`. Exits with status `1` on failure.
 
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
