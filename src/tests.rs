@@ -52,7 +52,7 @@ fn simple_config() -> Config {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![], // per-line mode: each line is its own block
-        record_start: None,
+        record_start: vec![],
         items: vec![item],
     }
 }
@@ -65,7 +65,7 @@ fn simple_delimited_config(delim_pat: &str) -> Config {
 
 fn simple_record_start_config(record_start_pat: &str) -> Config {
     let mut cfg = simple_config();
-    cfg.record_start = Some(Regex::new(record_start_pat).unwrap());
+    cfg.record_start = vec![Regex::new(record_start_pat).unwrap()];
     cfg
 }
 
@@ -95,22 +95,22 @@ fn count_events(result: &CompareResult) -> (usize, usize, usize) {
     (matches, extras, missing)
 }
 
-// ── Delimiters (general.delimiters + compile_delimiters) ────────────
+// ── Delimiters (general.delimiters + compile_patterns) ──────────────
 
 #[test]
 fn compile_delimiters_none_is_empty() {
     let general = RawGeneral::default();
-    let delims = compile_delimiters(&general).unwrap();
+    let delims = compile_patterns(&general.delimiters, "delimiter").unwrap();
     assert!(delims.is_empty());
 }
 
 #[test]
 fn compile_delimiters_single() {
     let general: RawGeneral = RawGeneral {
-        delimiters: Some(DelimiterValue::Single(r"^---$".into())),
+        delimiters: Some(PatternList::Single(r"^---$".into())),
         ..Default::default()
     };
-    let delims = compile_delimiters(&general).unwrap();
+    let delims = compile_patterns(&general.delimiters, "delimiter").unwrap();
     assert_eq!(delims.len(), 1);
     assert!(delims[0].is_match("---"));
     assert!(!delims[0].is_match("----"));
@@ -119,10 +119,10 @@ fn compile_delimiters_single() {
 #[test]
 fn compile_delimiters_list() {
     let general = RawGeneral {
-        delimiters: Some(DelimiterValue::List(vec![r"^---$".into(), r"^===$".into()])),
+        delimiters: Some(PatternList::List(vec![r"^---$".into(), r"^===$".into()])),
         ..Default::default()
     };
-    let delims = compile_delimiters(&general).unwrap();
+    let delims = compile_patterns(&general.delimiters, "delimiter").unwrap();
     assert_eq!(delims.len(), 2);
     assert!(delims[0].is_match("---"));
     assert!(delims[1].is_match("==="));
@@ -131,10 +131,10 @@ fn compile_delimiters_list() {
 #[test]
 fn compile_delimiters_invalid_regex_rejected() {
     let general = RawGeneral {
-        delimiters: Some(DelimiterValue::Single(r"(".into())),
+        delimiters: Some(PatternList::Single(r"(".into())),
         ..Default::default()
     };
-    assert!(compile_delimiters(&general).is_err());
+    assert!(compile_patterns(&general.delimiters, "delimiter").is_err());
 }
 
 #[test]
@@ -144,32 +144,60 @@ fn is_delimiter_line_matches_any_delimiter() {
     assert!(!is_delimiter_line(" --- ", &cfg)); // regex is anchored + exact
 }
 
-// ── record_start (general.record_start + compile_record_start) ──────
+// ── record_start (general.record_start + compile_patterns) ──────────
 
 #[test]
-fn compile_record_start_none_is_none() {
+fn compile_record_start_none_is_empty() {
     let general = RawGeneral::default();
-    assert!(compile_record_start(&general).unwrap().is_none());
+    assert!(compile_patterns(&general.record_start, "record_start").unwrap().is_empty());
 }
 
 #[test]
-fn compile_record_start_compiles_pattern() {
+fn compile_record_start_single() {
     let general = RawGeneral {
-        record_start: Some(r"^\d{4}-\d{2}-\d{2}".into()),
+        record_start: Some(PatternList::Single(r"^\d{4}-\d{2}-\d{2}".into())),
         ..Default::default()
     };
-    let re = compile_record_start(&general).unwrap().unwrap();
-    assert!(re.is_match("2024-01-01 ..."));
-    assert!(!re.is_match("  at com.example"));
+    let patterns = compile_patterns(&general.record_start, "record_start").unwrap();
+    assert_eq!(patterns.len(), 1);
+    assert!(patterns[0].is_match("2024-01-01 ..."));
+    assert!(!patterns[0].is_match("  at com.example"));
+}
+
+#[test]
+fn compile_record_start_list() {
+    let general = RawGeneral {
+        record_start: Some(PatternList::List(vec![
+            r"^\d{4}-\d{2}-\d{2}".into(),
+            r"^\[TRACE\]".into(),
+        ])),
+        ..Default::default()
+    };
+    let patterns = compile_patterns(&general.record_start, "record_start").unwrap();
+    assert_eq!(patterns.len(), 2);
+    assert!(patterns[0].is_match("2024-01-01 ..."));
+    assert!(patterns[1].is_match("[TRACE] starting up"));
 }
 
 #[test]
 fn compile_record_start_invalid_regex_rejected() {
     let general = RawGeneral {
-        record_start: Some(r"(".into()),
+        record_start: Some(PatternList::Single(r"(".into())),
         ..Default::default()
     };
-    assert!(compile_record_start(&general).is_err());
+    assert!(compile_patterns(&general.record_start, "record_start").is_err());
+}
+
+#[test]
+fn is_record_start_line_matches_any_pattern() {
+    let mut cfg = simple_config();
+    cfg.record_start = vec![
+        Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap(),
+        Regex::new(r"^\[TRACE\]").unwrap(),
+    ];
+    assert!(is_record_start_line("2024-01-01 10:00:00 INFO x", &cfg));
+    assert!(is_record_start_line("[TRACE] starting up", &cfg));
+    assert!(!is_record_start_line("  at com.example", &cfg));
 }
 
 // ── parse_log with record_start ──────────────────────────────────────
@@ -211,7 +239,7 @@ fn parse_log_record_start_splits_consecutive_multiline_records() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
-        record_start: Some(Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()),
+        record_start: vec![Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()],
         items: vec![item],
     };
 
@@ -307,7 +335,7 @@ fn validate_record_start_error_reports_block_start_line() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
-        record_start: Some(Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()),
+        record_start: vec![Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()],
         items: vec![item],
     };
     let log = concat!(
@@ -548,7 +576,7 @@ atom = "level"
     let raw: RawConfig = toml::from_str(toml_str).unwrap();
     let general = raw.general.unwrap();
     match general.delimiters.unwrap() {
-        DelimiterValue::Single(s) => assert_eq!(s, "^---$"),
+        PatternList::Single(s) => assert_eq!(s, "^---$"),
         _ => panic!("expected single delimiter"),
     }
 }
@@ -570,8 +598,52 @@ atom = "level"
     let raw: RawConfig = toml::from_str(toml_str).unwrap();
     let general = raw.general.unwrap();
     match general.delimiters.unwrap() {
-        DelimiterValue::List(v) => assert_eq!(v, vec!["^---$", "^===$"]),
+        PatternList::List(v) => assert_eq!(v, vec!["^---$", "^===$"]),
         _ => panic!("expected list delimiters"),
+    }
+}
+
+#[test]
+fn config_toml_with_general_record_start_single() {
+    let toml_str = r#"
+[general]
+record_start = "^\\d{4}-\\d{2}-\\d{2}"
+
+[atoms]
+level = "INFO"
+
+[[items]]
+name = "entry"
+[[items.parts]]
+atom = "level"
+"#;
+    let raw: RawConfig = toml::from_str(toml_str).unwrap();
+    let general = raw.general.unwrap();
+    match general.record_start.unwrap() {
+        PatternList::Single(s) => assert_eq!(s, "^\\d{4}-\\d{2}-\\d{2}"),
+        _ => panic!("expected single record_start"),
+    }
+}
+
+#[test]
+fn config_toml_with_general_record_start_list() {
+    let toml_str = r#"
+[general]
+record_start = ["^\\d{4}-\\d{2}-\\d{2}", "^\\[TRACE\\]"]
+
+[atoms]
+level = "INFO"
+
+[[items]]
+name = "entry"
+[[items.parts]]
+atom = "level"
+"#;
+    let raw: RawConfig = toml::from_str(toml_str).unwrap();
+    let general = raw.general.unwrap();
+    match general.record_start.unwrap() {
+        PatternList::List(v) => assert_eq!(v, vec!["^\\d{4}-\\d{2}-\\d{2}", "^\\[TRACE\\]"]),
+        _ => panic!("expected list record_start"),
     }
 }
 
@@ -657,7 +729,7 @@ fn parse_log_signature_excludes_ignored_atoms() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
-        record_start: None,
+        record_start: vec![],
         items: vec![item],
     };
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
@@ -960,7 +1032,7 @@ fn integration_blacklist_ignores_timestamp() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
-        record_start: None,
+        record_start: vec![],
         items: vec![item],
     };
     let clean_log = "2024-01-01 10:00:00 INFO hello\n";
@@ -1129,7 +1201,7 @@ fn validate_multiline_item_counted() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![Regex::new(r"^---$").unwrap()],
-        record_start: None,
+        record_start: vec![],
         items: vec![item],
     };
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
@@ -1265,7 +1337,7 @@ fn diagnose_best_match_selection_multiple_items() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
-        record_start: None,
+        record_start: vec![],
         items: vec![item1, item2],
     };
 
@@ -1290,7 +1362,7 @@ fn diagnose_with_flags_ignorecase() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
-        record_start: None,
+        record_start: vec![],
         items: vec![item],
     };
 

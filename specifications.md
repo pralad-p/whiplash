@@ -28,9 +28,9 @@ Whiplash compares two log files (“clean” and “dirty”) by parsing them in
 - `delimiters` (string or list of strings, optional)
   - Regex(es) identifying delimiter lines that split the log into blocks.
   - Without delimiters or `record_start`, every line is its own block (per-line records).
-- `record_start` (string, optional)
-  - Regex matching the first line of a new record. A block ends (and a new one begins) right before any line matching this pattern, even with no delimiter line between records.
-  - Lets consecutive multi-line records be split by recognizing where the next one begins, instead of requiring an explicit separator. Can be combined with `delimiters`: either mechanism can end a block.
+- `record_start` (string or list of strings, optional)
+  - Regex(es) matching the first line of a new record. A block ends (and a new one begins) right before any line matching any of these patterns, even with no delimiter line between records.
+  - Lets consecutive multi-line records be split by recognizing where the next one begins, instead of requiring an explicit separator. A list is useful when different record types start differently (e.g. one pattern per record type). Can be combined with `delimiters`: either mechanism can end a block.
 
 ### `atoms`
 - A map of atom names to regex strings.
@@ -69,7 +69,7 @@ For each item:
 - Input logs are read as UTF-8; invalid byte sequences are replaced rather than failing.
 - The log is split into blocks:
   - With `general.delimiters` configured, a block ends at a line matching a delimiter regex (the delimiter line itself is discarded).
-  - With `general.record_start` configured, a block ends right before a line matching that regex (the matching line becomes the first line of the next block). Combinable with `delimiters` — either condition ends a block.
+  - With `general.record_start` configured, a block ends right before a line matching any of those regexes (the matching line becomes the first line of the next block). Combinable with `delimiters` — either condition ends a block.
   - With neither configured, every line is its own block.
   - Blocks may span multiple lines under either mechanism.
 - For each block, item patterns are tried in config order; the first pattern that matches the **entire block** (start to end, trailing newlines excluded) wins.
