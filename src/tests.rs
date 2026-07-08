@@ -52,6 +52,7 @@ fn simple_config() -> Config {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![], // per-line mode: each line is its own block
+        record_start: None,
         items: vec![item],
     }
 }
@@ -59,6 +60,12 @@ fn simple_config() -> Config {
 fn simple_delimited_config(delim_pat: &str) -> Config {
     let mut cfg = simple_config();
     cfg.delimiters = vec![Regex::new(delim_pat).unwrap()];
+    cfg
+}
+
+fn simple_record_start_config(record_start_pat: &str) -> Config {
+    let mut cfg = simple_config();
+    cfg.record_start = Some(Regex::new(record_start_pat).unwrap());
     cfg
 }
 
@@ -135,6 +142,184 @@ fn is_delimiter_line_matches_any_delimiter() {
     let cfg = simple_delimited_config(r"^---$");
     assert!(is_delimiter_line("---", &cfg));
     assert!(!is_delimiter_line(" --- ", &cfg)); // regex is anchored + exact
+}
+
+// ── record_start (general.record_start + compile_record_start) ──────
+
+#[test]
+fn compile_record_start_none_is_none() {
+    let general = RawGeneral::default();
+    assert!(compile_record_start(&general).unwrap().is_none());
+}
+
+#[test]
+fn compile_record_start_compiles_pattern() {
+    let general = RawGeneral {
+        record_start: Some(r"^\d{4}-\d{2}-\d{2}".into()),
+        ..Default::default()
+    };
+    let re = compile_record_start(&general).unwrap().unwrap();
+    assert!(re.is_match("2024-01-01 ..."));
+    assert!(!re.is_match("  at com.example"));
+}
+
+#[test]
+fn compile_record_start_invalid_regex_rejected() {
+    let general = RawGeneral {
+        record_start: Some(r"(".into()),
+        ..Default::default()
+    };
+    assert!(compile_record_start(&general).is_err());
+}
+
+// ── parse_log with record_start ──────────────────────────────────────
+
+#[test]
+fn parse_log_record_start_splits_consecutive_multiline_records() {
+    // Item spans two lines (a timestamped line + a continuation line).
+    let atoms = make_atoms();
+    let parts = vec![
+        RawPart {
+            atom: Some("timestamp".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(" ".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("level".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(r"\n".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("message".into()),
+            regex: None,
+            ..Default::default()
+        },
+    ];
+    let raw = raw_item_with_parts("entry", parts);
+    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let config = Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        delimiters: vec![],
+        record_start: Some(Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()),
+        items: vec![item],
+    };
+
+    // Two records back-to-back, no blank line or delimiter between them.
+    let log = concat!(
+        "2024-01-01 10:00:00 INFO\n",
+        "first message\n",
+        "2024-01-01 10:00:01 WARN\n",
+        "second message\n",
+    );
+    let (items, unparsed) = parse_log(log, &config);
+    assert_eq!(items.len(), 2);
+    assert!(unparsed.is_empty());
+    assert_eq!(items[0].line_no, 1);
+    assert_eq!(items[0].raw_line, "2024-01-01 10:00:00 INFO\nfirst message");
+    assert_eq!(items[1].line_no, 3);
+    assert_eq!(items[1].raw_line, "2024-01-01 10:00:01 WARN\nsecond message");
+}
+
+#[test]
+fn parse_log_record_start_first_line_does_not_flush_empty_block() {
+    let config = simple_record_start_config(r"^\d{4}-\d{2}-\d{2}");
+    let (items, unparsed) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
+    assert_eq!(items.len(), 1);
+    assert!(unparsed.is_empty());
+}
+
+#[test]
+fn parse_log_record_start_combined_with_delimiters() {
+    // record_start splits consecutive records; an explicit delimiter line
+    // still also ends a block.
+    let mut config = simple_record_start_config(r"^\d{4}-\d{2}-\d{2}");
+    config.delimiters = vec![Regex::new(r"^---$").unwrap()];
+    let log = concat!(
+        "2024-01-01 10:00:00 INFO a\n",
+        "2024-01-01 10:00:01 WARN b\n",
+        "---\n",
+        "2024-01-01 10:00:02 INFO c\n",
+    );
+    let (items, unparsed) = parse_log(log, &config);
+    assert_eq!(items.len(), 3);
+    assert!(unparsed.is_empty());
+    assert_eq!(items[0].line_no, 1);
+    assert_eq!(items[1].line_no, 2);
+    assert_eq!(items[2].line_no, 4);
+}
+
+// ── validate with record_start ───────────────────────────────────────
+
+#[test]
+fn validate_record_start_splits_consecutive_records() {
+    let config = simple_record_start_config(r"^\d{4}-\d{2}-\d{2}");
+    let log = "2024-01-01 10:00:00 INFO a\n2024-01-01 10:00:01 WARN b\n";
+    let result = validate(log.as_bytes(), &config).unwrap();
+    assert!(result.error.is_none());
+    assert!(result.output.contains("Processed 2 items"));
+    assert!(result.output.contains("Config.toml correct 🟢"));
+}
+
+#[test]
+fn validate_record_start_error_reports_block_start_line() {
+    let atoms = make_atoms();
+    let parts = vec![
+        RawPart {
+            atom: Some("timestamp".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(" ".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("level".into()),
+            regex: None,
+            ..Default::default()
+        },
+        RawPart {
+            atom: None,
+            regex: Some(r"\n".into()),
+            ..Default::default()
+        },
+        RawPart {
+            atom: Some("message".into()),
+            regex: None,
+            ..Default::default()
+        },
+    ];
+    let raw = raw_item_with_parts("entry", parts);
+    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let config = Config {
+        index_threshold: 0,
+        max_failed_items: 0,
+        delimiters: vec![],
+        record_start: Some(Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap()),
+        items: vec![item],
+    };
+    let log = concat!(
+        "2024-01-01 10:00:00 INFO\n",
+        "first message\n",
+        "2024-01-01 10:00:01 BADLEVEL\n",
+        "second message\n",
+    );
+    let result = validate(log.as_bytes(), &config).unwrap();
+    assert!(result.error.is_some());
+    let err = result.error.unwrap();
+    assert!(err.contains("validation error at line 3"));
 }
 
 // ── compile_item ─────────────────────────────────────────────────────
@@ -472,6 +657,7 @@ fn parse_log_signature_excludes_ignored_atoms() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
+        record_start: None,
         items: vec![item],
     };
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
@@ -774,6 +960,7 @@ fn integration_blacklist_ignores_timestamp() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
+        record_start: None,
         items: vec![item],
     };
     let clean_log = "2024-01-01 10:00:00 INFO hello\n";
@@ -942,6 +1129,7 @@ fn validate_multiline_item_counted() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![Regex::new(r"^---$").unwrap()],
+        record_start: None,
         items: vec![item],
     };
     let log = "2024-01-01 10:00:00 INFO\nhello world\n";
@@ -1077,6 +1265,7 @@ fn diagnose_best_match_selection_multiple_items() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
+        record_start: None,
         items: vec![item1, item2],
     };
 
@@ -1101,6 +1290,7 @@ fn diagnose_with_flags_ignorecase() {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
+        record_start: None,
         items: vec![item],
     };
 

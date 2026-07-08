@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -10,6 +10,24 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── Colors ───────────────────────────────────────────────────────────
+// Raw ANSI SGR codes, always embedded in the strings this module builds.
+// `anstream` strips them at the point of writing (see `main`/`run`) when
+// stdout isn't a terminal or `NO_COLOR`/`CLICOLOR` say not to color.
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RED: &str = "\x1b[31m";
+const RED_BOLD: &str = "\x1b[1;31m";
+const GREEN: &str = "\x1b[32m";
+const GREEN_BOLD: &str = "\x1b[1;32m";
+
+/// Wrap `text` in `code`, resetting styling afterward.
+fn style(code: &str, text: &str) -> String {
+    format!("{code}{text}{RESET}")
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────
 
@@ -31,6 +49,11 @@ struct Cli {
     /// Validate config against a single log file
     #[arg(long)]
     validate: bool,
+
+    /// Open an interactive side-by-side view with a live minimap instead of
+    /// the default divergence output
+    #[arg(long, conflicts_with = "validate")]
+    side_by_side: bool,
 
     /// Clean (reference) log file
     clean_log: PathBuf,
@@ -61,6 +84,7 @@ struct RawGeneral {
     max_failed_items: Option<usize>,
     blacklist_atoms: Option<Vec<String>>,
     delimiters: Option<DelimiterValue>,
+    record_start: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +118,11 @@ struct Config {
     index_threshold: usize,
     max_failed_items: usize,
     delimiters: Vec<Regex>,
+    /// A line matching this pattern starts a new block, without needing a
+    /// delimiter line. Lets consecutive multi-line records be split by
+    /// recognizing where the next one begins (e.g. a timestamp at the start
+    /// of a line) instead of requiring a separator between them.
+    record_start: Option<Regex>,
     items: Vec<CompiledItem>,
 }
 
@@ -143,6 +172,7 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
         index_threshold: cli.threshold.or(general.index_threshold).unwrap_or(0),
         max_failed_items: cli.max_failed.or(general.max_failed_items).unwrap_or(0),
         delimiters: compile_delimiters(&general)?,
+        record_start: compile_record_start(&general)?,
         items,
     })
 }
@@ -163,6 +193,14 @@ fn compile_delimiters(general: &RawGeneral) -> Result<Vec<Regex>> {
     raw.iter()
         .map(|pat| Regex::new(pat).with_context(|| format!("invalid delimiter regex: {}", pat)))
         .collect()
+}
+
+fn compile_record_start(general: &RawGeneral) -> Result<Option<Regex>> {
+    general
+        .record_start
+        .as_ref()
+        .map(|pat| Regex::new(pat).with_context(|| format!("invalid record_start regex: {}", pat)))
+        .transpose()
 }
 
 fn compile_item(
@@ -300,47 +338,95 @@ fn item_from_caps(
 
 // ── Log parsing ──────────────────────────────────────────────────────
 
-/// Split `content` into blocks and parse each one. Blocks are separated by
-/// delimiter lines; without configured delimiters every line is its own block.
+/// Accumulates lines into blocks for `general.delimiters` and
+/// `general.record_start`:
+/// - A delimiter line ends the current block and is discarded.
+/// - A `record_start` match ends the current block and starts a new one
+///   beginning with that line — for consecutive multi-line records with no
+///   separator between them.
+/// - With neither configured, every line is its own block.
+struct BlockSplitter<'a> {
+    config: &'a Config,
+    per_line: bool,
+    block: String,
+    block_start_line: usize,
+    line_no: usize,
+}
+
+impl<'a> BlockSplitter<'a> {
+    fn new(config: &'a Config) -> Self {
+        BlockSplitter {
+            config,
+            per_line: config.delimiters.is_empty() && config.record_start.is_none(),
+            block: String::new(),
+            block_start_line: 1,
+            line_no: 1,
+        }
+    }
+
+    /// Feed one line, including its trailing newline if any. Returns a
+    /// completed block (start line, text) if this line closed one.
+    fn push(&mut self, line: &str) -> Option<(usize, String)> {
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let mut completed = None;
+
+        if is_delimiter_line(stripped, self.config) {
+            completed = self.take();
+        } else {
+            let starts_new_record = !self.block.is_empty()
+                && self
+                    .config
+                    .record_start
+                    .as_ref()
+                    .is_some_and(|re| re.is_match(stripped));
+            if starts_new_record {
+                completed = self.take();
+            }
+            if self.block.is_empty() {
+                self.block_start_line = self.line_no;
+            }
+            self.block.push_str(line);
+            if self.per_line {
+                completed = self.take();
+            }
+        }
+
+        self.line_no += 1;
+        completed
+    }
+
+    fn take(&mut self) -> Option<(usize, String)> {
+        if self.block.is_empty() {
+            return None;
+        }
+        Some((self.block_start_line, std::mem::take(&mut self.block)))
+    }
+
+    fn finish(mut self) -> Option<(usize, String)> {
+        self.take()
+    }
+}
+
+/// Split `content` into blocks (see `BlockSplitter`) and parse each one.
 /// A block parses only if an item pattern matches it in full.
 fn parse_log(content: &str, config: &Config) -> (Vec<ParsedItem>, Vec<usize>) {
-    fn flush(
-        block: &mut String,
-        start: usize,
-        config: &Config,
-        items: &mut Vec<ParsedItem>,
-        unparsed: &mut Vec<usize>,
-    ) {
-        if block.is_empty() {
-            return;
-        }
-        match parse_block(block, start, config) {
-            Some(item) => items.push(item),
-            None => unparsed.push(start),
-        }
-        block.clear();
-    }
-
-    let per_line = config.delimiters.is_empty();
     let mut items = Vec::new();
     let mut unparsed_blocks = Vec::new();
-    let mut block = String::new();
-    let mut block_start_line: usize = 1;
+    let mut splitter = BlockSplitter::new(config);
 
-    for (i, line) in content.split_inclusive('\n').enumerate() {
-        if is_delimiter_line(line.trim_end_matches(['\n', '\r']), config) {
-            flush(&mut block, block_start_line, config, &mut items, &mut unparsed_blocks);
-        } else {
-            if block.is_empty() {
-                block_start_line = i + 1; // 1-based
-            }
-            block.push_str(line);
-            if per_line {
-                flush(&mut block, block_start_line, config, &mut items, &mut unparsed_blocks);
-            }
+    let mut record = |start: usize, block: &str| match parse_block(block, start, config) {
+        Some(item) => items.push(item),
+        None => unparsed_blocks.push(start),
+    };
+
+    for line in content.split_inclusive('\n') {
+        if let Some((start, block)) = splitter.push(line) {
+            record(start, &block);
         }
     }
-    flush(&mut block, block_start_line, config, &mut items, &mut unparsed_blocks);
+    if let Some((start, block)) = splitter.finish() {
+        record(start, &block);
+    }
 
     (items, unparsed_blocks)
 }
@@ -374,6 +460,11 @@ struct CompareResult {
     events: Vec<CompareEvent>,
     stopped: bool,
     stop_reason: Option<String>,
+    /// Full match assignment from Phase 1 (dirty index -> matched clean
+    /// index), independent of early-stop truncation. Used by the
+    /// side-by-side view to lay out the whole comparison regardless of
+    /// where the plain-text output would have stopped.
+    dirty_to_clean: Vec<Option<usize>>,
 }
 
 fn compare(
@@ -435,6 +526,7 @@ fn compare(
         events,
         stopped,
         stop_reason,
+        dirty_to_clean,
     }
 }
 
@@ -489,15 +581,18 @@ fn validation_failure(
     config: &Config,
 ) -> ValidateResult {
     let first_line = content.lines().next().unwrap_or("").trim();
+    // Plain, uncolored: used for the exit-code decision and asserted on directly
+    // by callers/tests, not meant for display.
     let error = format!(
         "validation error at line {}: no pattern matched '{}'",
         line_no, first_line
     );
     let output = format!(
-        "Processed {} items\n{}\n{}\nValidation failed, issue with Config.toml 🔴",
+        "Processed {} items\n{}\n{}\n{}",
         processed,
-        error,
-        diagnose_mismatch(content, config).trim_end()
+        style(RED_BOLD, &error),
+        diagnose_mismatch(content, config).trim_end(),
+        style(RED_BOLD, "Validation failed, issue with Config.toml 🔴"),
     );
     ValidateResult {
         output,
@@ -617,32 +712,41 @@ fn diagnose_mismatch(content: &str, config: &Config) -> String {
     let total = item.diagnostic_parts.len();
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "  Best match: item '{}' (matched {}/{} parts)\n",
-        item.name,
-        matched.len(),
-        total
+    out.push_str(&style(
+        BOLD,
+        &format!(
+            "  Best match: item '{}' (matched {}/{} parts)",
+            item.name,
+            matched.len(),
+            total
+        ),
     ));
+    out.push('\n');
 
     for (label, captured) in &matched {
         let text = match captured {
             Some(val) => format!("{} = \"{}\"", label, val),
             None => label.clone(),
         };
-        out.push_str(&format!("    {:40} [matched]\n", text));
+        out.push_str(&style(GREEN, &format!("    {:40} [matched]", text)));
+        out.push('\n');
     }
 
     if let Some(ref f) = failed {
-        out.push_str(&format!("    {:40} [no match]\n", f.label));
-        out.push_str(&format!("      pattern: {}\n", f.pattern));
-        out.push_str(&format!("      got:     \"{}\"\n", f.got));
+        out.push_str(&style(RED_BOLD, &format!("    {:40} [no match]", f.label)));
+        out.push('\n');
+        out.push_str(&style(RED, &format!("      pattern: {}", f.pattern)));
+        out.push('\n');
+        out.push_str(&style(RED, &format!("      got:     \"{}\"", f.got)));
+        out.push('\n');
     }
 
     let remaining = total
         .saturating_sub(matched.len())
         .saturating_sub(failed.is_some() as usize);
     if remaining > 0 {
-        out.push_str("    ...\n");
+        out.push_str(&style(DIM, "    ..."));
+        out.push('\n');
     }
 
     out
@@ -669,17 +773,14 @@ fn snippet(content: &str, offset: usize) -> String {
     }
 }
 
-/// Check the pending block against the item patterns, resetting it on
-/// success. Returns the failure result if no pattern matched.
-fn flush_block(
-    block: &mut String,
+/// Check a block against the item patterns. Returns the failure result if
+/// no pattern matched it in full.
+fn check_block(
     start_line: usize,
+    block: &str,
     processed: &mut usize,
     config: &Config,
 ) -> Option<ValidateResult> {
-    if block.is_empty() {
-        return None;
-    }
     if parse_block(block, start_line, config).is_none() {
         return Some(validation_failure(
             *processed,
@@ -689,18 +790,14 @@ fn flush_block(
         ));
     }
     *processed += 1;
-    block.clear();
     None
 }
 
 /// Stream-based validation: reads line by line, accumulating blocks the same
 /// way as `parse_log`, and stops at the first block no pattern matches.
 fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult> {
-    let per_line = config.delimiters.is_empty();
     let mut processed: usize = 0;
-    let mut block = String::new();
-    let mut block_start_line: usize = 1;
-    let mut line_no: usize = 1;
+    let mut splitter = BlockSplitter::new(config);
     let mut raw = String::new();
 
     loop {
@@ -715,40 +812,33 @@ fn validate(mut reader: impl BufRead, config: &Config) -> Result<ValidateResult>
         }
 
         for line in cleaned.split_inclusive('\n') {
-            if is_delimiter_line(line.trim_end_matches(['\n', '\r']), config) {
-                if let Some(fail) = flush_block(&mut block, block_start_line, &mut processed, config) {
+            if let Some((start, block)) = splitter.push(line) {
+                if let Some(fail) = check_block(start, &block, &mut processed, config) {
                     return Ok(fail);
                 }
-            } else {
-                if block.is_empty() {
-                    block_start_line = line_no;
-                }
-                block.push_str(line);
-                if per_line {
-                    if let Some(fail) =
-                        flush_block(&mut block, block_start_line, &mut processed, config)
-                    {
-                        return Ok(fail);
-                    }
-                }
             }
-            line_no += 1;
         }
     }
 
-    if let Some(fail) = flush_block(&mut block, block_start_line, &mut processed, config) {
-        return Ok(fail);
+    if let Some((start, block)) = splitter.finish() {
+        if let Some(fail) = check_block(start, &block, &mut processed, config) {
+            return Ok(fail);
+        }
     }
 
     Ok(ValidateResult {
-        output: format!("Processed {} items\nConfig.toml correct 🟢", processed),
+        output: format!(
+            "Processed {} items\n{}",
+            processed,
+            style(GREEN_BOLD, "Config.toml correct 🟢")
+        ),
         error: None,
     })
 }
 
 // ── main ─────────────────────────────────────────────────────────────
 
-fn main() -> Result<()> {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -757,6 +847,13 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    if let Err(err) = run() {
+        let _ = writeln!(anstream::stderr(), "{} {err:?}", style(RED_BOLD, "Error:"));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     info!(config = %cli.config.display(), "loading configuration");
@@ -767,7 +864,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to open '{}'", cli.clean_log.display()))?;
         let reader = std::io::BufReader::new(file);
         let result = validate(reader, &config)?;
-        println!("{}", result.output);
+        writeln!(anstream::stdout(), "{}", result.output)?;
         if result.error.is_some() {
             std::process::exit(1);
         }
@@ -803,7 +900,11 @@ fn main() -> Result<()> {
         config.max_failed_items,
     );
 
-    print_output(&result, &clean_items, &dirty_items);
+    if cli.side_by_side {
+        tui::run_side_by_side(&clean_items, &dirty_items, &result)?;
+    } else {
+        print_output(&result, &clean_items, &dirty_items);
+    }
 
     Ok(())
 }
@@ -812,6 +913,8 @@ fn read_file_lossy(path: &PathBuf) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read '{}'", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
+
+mod tui;
 
 // ── Tests ────────────────────────────────────────────────────────────
 
