@@ -197,14 +197,82 @@ fn minimap_connector(model: &MinimapModel) -> Line<'static> {
     Line::from(spans)
 }
 
+// ── Search ───────────────────────────────────────────────────────────
+
+/// Does this row's clean or dirty content contain `query_lower`
+/// (case-insensitive)?
+fn row_contains(row: &Row, clean_items: &[ParsedItem], dirty_items: &[ParsedItem], query_lower: &str) -> bool {
+    let side_has = |item: Option<&ParsedItem>| {
+        item.is_some_and(|it| display_line(&it.raw_line).to_lowercase().contains(query_lower))
+    };
+    side_has(row.clean.map(|ci| &clean_items[ci])) || side_has(row.dirty.map(|di| &dirty_items[di]))
+}
+
+/// Row indices whose clean or dirty content contains `query`, in row order.
+fn find_matches(rows: &[Row], clean_items: &[ParsedItem], dirty_items: &[ParsedItem], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query_lower = query.to_lowercase();
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row_contains(row, clean_items, dirty_items, &query_lower))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Cycles to the next (or, if `forward` is false, previous) match, wrapping
+/// around. `matches` must be non-empty and sorted ascending.
+fn cycle_match(matches: &[usize], current: usize, forward: bool) -> usize {
+    if forward {
+        matches.iter().copied().find(|&m| m > current).unwrap_or(matches[0])
+    } else {
+        matches.iter().copied().rev().find(|&m| m < current).unwrap_or(*matches.last().unwrap())
+    }
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 
 fn display_line(raw: &str) -> String {
     raw.replace('\n', " ⏎ ")
 }
 
-fn build_table<'a>(clean_items: &[ParsedItem], dirty_items: &[ParsedItem], rows: &'a [Row]) -> Table<'a> {
+/// Splits `text` into spans, highlighting case-insensitive occurrences of
+/// `query_lower`. Only attempts highlighting on ASCII text, since a
+/// case-folded byte offset isn't safe to reuse against the original string
+/// otherwise; non-ASCII text is still searchable (`row_contains` handles
+/// that separately), just not highlighted.
+fn highlighted_spans(text: &str, query_lower: &str, base: Style, highlight: Style) -> Vec<Span<'static>> {
+    if query_lower.is_empty() || !text.is_ascii() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    while let Some(offset) = lower[pos..].find(query_lower) {
+        let start = pos + offset;
+        let end = start + query_lower.len();
+        if start > pos {
+            spans.push(Span::styled(text[pos..start].to_string(), base));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), highlight));
+        pos = end;
+    }
+    if pos < text.len() {
+        spans.push(Span::styled(text[pos..].to_string(), base));
+    }
+    spans
+}
+
+fn build_table<'a>(
+    clean_items: &[ParsedItem],
+    dirty_items: &[ParsedItem],
+    rows: &'a [Row],
+    query: &str,
+) -> Table<'a> {
     let id_width = rows.len().max(1).to_string().len();
+    let query_lower = query.to_lowercase();
+    let highlight_style = Style::new().bg(Color::Yellow).fg(Color::Black);
 
     let trows = rows.iter().enumerate().map(|(i, row)| {
         let status = row.status();
@@ -213,11 +281,17 @@ fn build_table<'a>(clean_items: &[ParsedItem], dirty_items: &[ParsedItem], rows:
 
         let cell = |item: Option<&ParsedItem>, icon: &str| -> Cell<'a> {
             match item {
-                Some(item) => Cell::from(format!(
-                    "{icon} {id:>id_width$}  {}",
-                    display_line(&item.raw_line)
-                ))
-                .style(Style::new().fg(color)),
+                Some(item) => {
+                    let base = Style::new().fg(color);
+                    let mut spans = vec![Span::styled(format!("{icon} {id:>id_width$}  "), base)];
+                    spans.extend(highlighted_spans(
+                        &display_line(&item.raw_line),
+                        &query_lower,
+                        base,
+                        highlight_style,
+                    ));
+                    Cell::from(Line::from(spans))
+                }
                 None => Cell::from(format!("  {id:>id_width$}  (missing)"))
                     .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
             }
@@ -243,9 +317,47 @@ fn build_table<'a>(clean_items: &[ParsedItem], dirty_items: &[ParsedItem], rows:
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
 }
 
+/// Search-related state needed for rendering: the confirmed query (used for
+/// highlighting), and either the in-progress input buffer or the current
+/// match list/position.
+struct SearchState<'a> {
+    mode: bool,
+    input: &'a str,
+    query: &'a str,
+    matches: &'a [usize],
+}
+
+fn footer_text(search: &SearchState, selected: usize) -> String {
+    const HINTS: &str =
+        "↑/↓ j/k: move   ←/→ h/l: jump   PgUp/PgDn: page   Home/End: start/end   /: search   q: quit";
+    if search.mode {
+        format!("/{}", search.input)
+    } else if !search.query.is_empty() {
+        if search.matches.is_empty() {
+            format!("/{}  (no matches)   {HINTS}", search.query)
+        } else {
+            let pos = search.matches.iter().position(|&m| m == selected).map_or(0, |p| p + 1);
+            format!(
+                "/{}  ({pos}/{} matches, n/N: next/prev)   {HINTS}",
+                search.query,
+                search.matches.len()
+            )
+        }
+    } else {
+        HINTS.to_string()
+    }
+}
+
 /// Draws one frame. Returns the approximate number of body rows visible,
 /// used to size PageUp/PageDown jumps.
-fn draw(frame: &mut Frame, clean_items: &[ParsedItem], dirty_items: &[ParsedItem], rows: &[Row], selected: usize) -> usize {
+fn draw(
+    frame: &mut Frame,
+    clean_items: &[ParsedItem],
+    dirty_items: &[ParsedItem],
+    rows: &[Row],
+    selected: usize,
+    search: &SearchState,
+) -> usize {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -269,14 +381,15 @@ fn draw(frame: &mut Frame, clean_items: &[ParsedItem], dirty_items: &[ParsedItem
     .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(minimap, chunks[0]);
 
-    let table = build_table(clean_items, dirty_items, rows);
+    let table = build_table(clean_items, dirty_items, rows, search.query);
     let mut state = TableState::default().with_selected(Some(selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
 
-    let footer = Paragraph::new(
-        "↑/↓ j/k: move   ←/→ h/l: jump   PgUp/PgDn: page   Home/End: start/end   q: quit",
-    )
-    .style(Style::new().add_modifier(Modifier::DIM));
+    let footer = Paragraph::new(footer_text(search, selected)).style(if search.mode {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::DIM)
+    });
     frame.render_widget(footer, chunks[2]);
 
     chunks[1].height.saturating_sub(3).max(1) as usize
@@ -293,15 +406,41 @@ fn run_app(
     let mut page_size: usize = 10;
     let jump = (rows.len() / 20).max(1);
 
+    let mut search_mode = false;
+    let mut search_input = String::new();
+    let mut query = String::new();
+    let mut matches: Vec<usize> = Vec::new();
+
     loop {
         terminal.draw(|frame| {
-            page_size = draw(frame, clean_items, dirty_items, rows, selected);
+            let search = SearchState { mode: search_mode, input: &search_input, query: &query, matches: &matches };
+            page_size = draw(frame, clean_items, dirty_items, rows, selected, &search);
         })?;
 
         let Event::Key(key) = event::read()? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if search_mode {
+            match key.code {
+                KeyCode::Enter => {
+                    query = search_input.clone();
+                    matches = find_matches(rows, clean_items, dirty_items, &query);
+                    if !matches.is_empty() {
+                        selected = *matches.iter().find(|&&m| m >= selected).unwrap_or(&matches[0]);
+                    }
+                    search_mode = false;
+                }
+                KeyCode::Esc => search_mode = false,
+                KeyCode::Backspace => {
+                    search_input.pop();
+                }
+                KeyCode::Char(c) => search_input.push(c),
+                _ => {}
+            }
             continue;
         }
 
@@ -316,6 +455,12 @@ fn run_app(
             KeyCode::PageUp => selected = selected.saturating_sub(page_size),
             KeyCode::Home | KeyCode::Char('g') => selected = 0,
             KeyCode::End | KeyCode::Char('G') => selected = last_row,
+            KeyCode::Char('/') => {
+                search_mode = true;
+                search_input = query.clone();
+            }
+            KeyCode::Char('n') if !matches.is_empty() => selected = cycle_match(&matches, selected, true),
+            KeyCode::Char('N') if !matches.is_empty() => selected = cycle_match(&matches, selected, false),
             _ => {}
         }
     }
@@ -356,6 +501,8 @@ pub fn run_side_by_side(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -489,5 +636,88 @@ mod tests {
         let model = build_minimap(&[], 5, 0);
         assert_eq!(model.cursor_bucket, 0);
         assert!(model.clean.iter().all(|s| s.is_none()));
+    }
+
+    // ── Search ───────────────────────────────────────────────────────
+
+    fn item(raw_line: &str) -> ParsedItem {
+        ParsedItem {
+            line_no: 1,
+            raw_line: raw_line.to_string(),
+            atom_values: HashMap::new(),
+            signature: (String::new(), Vec::new()),
+        }
+    }
+
+    #[test]
+    fn find_matches_empty_query_matches_nothing() {
+        let clean = vec![item("hello world")];
+        let rows = vec![Row { clean: Some(0), dirty: None }];
+        assert!(find_matches(&rows, &clean, &[], "").is_empty());
+    }
+
+    #[test]
+    fn find_matches_is_case_insensitive_and_checks_both_sides() {
+        let clean = vec![item("Connection RESET by peer")];
+        let dirty = vec![item("unrelated")];
+        let rows = vec![Row { clean: Some(0), dirty: Some(0) }];
+        assert_eq!(find_matches(&rows, &clean, &dirty, "reset"), vec![0]);
+    }
+
+    #[test]
+    fn find_matches_only_dirty_side_still_matches_row() {
+        let clean = vec![item("nothing here")];
+        let dirty = vec![item("boom: panic")];
+        let rows = vec![Row { clean: Some(0), dirty: Some(0) }];
+        assert_eq!(find_matches(&rows, &clean, &dirty, "panic"), vec![0]);
+    }
+
+    #[test]
+    fn find_matches_skips_rows_without_a_hit() {
+        let clean = vec![item("a"), item("b"), item("panic here")];
+        let rows: Vec<Row> = (0..3).map(|i| Row { clean: Some(i), dirty: None }).collect();
+        assert_eq!(find_matches(&rows, &clean, &[], "panic"), vec![2]);
+    }
+
+    #[test]
+    fn cycle_match_forward_wraps_to_first() {
+        let matches = [2usize, 5, 9];
+        assert_eq!(cycle_match(&matches, 5, true), 9);
+        assert_eq!(cycle_match(&matches, 9, true), 2); // wraps
+    }
+
+    #[test]
+    fn cycle_match_backward_wraps_to_last() {
+        let matches = [2usize, 5, 9];
+        assert_eq!(cycle_match(&matches, 5, false), 2);
+        assert_eq!(cycle_match(&matches, 2, false), 9); // wraps
+    }
+
+    #[test]
+    fn highlighted_spans_no_query_returns_single_plain_span() {
+        let spans = highlighted_spans("hello", "", Style::new(), Style::new());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "hello");
+    }
+
+    #[test]
+    fn highlighted_spans_splits_on_match() {
+        let spans = highlighted_spans("connection reset by peer", "reset", Style::new(), Style::new());
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["connection ", "reset", " by peer"]);
+    }
+
+    #[test]
+    fn highlighted_spans_matches_multiple_occurrences() {
+        let spans = highlighted_spans("aXbXc", "x", Style::new(), Style::new());
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["a", "X", "b", "X", "c"]);
+    }
+
+    #[test]
+    fn highlighted_spans_non_ascii_falls_back_to_unhighlighted() {
+        let spans = highlighted_spans("caf\u{e9} error", "error", Style::new(), Style::new());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "caf\u{e9} error");
     }
 }
