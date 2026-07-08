@@ -135,6 +135,7 @@ Arguments:
 - A minimap strip above the table shows one column per row (or, once there are more rows than columns, one column per bucket of rows, colored by the worst status in the bucket): green for an aligned match, gray for a threshold-shifted match (with a connecting line between the clean/dirty strips), red for no match. A live marker tracks the current viewport position on the minimap as you navigate.
 - Lays out the full comparison regardless of where `--max-failed` early-stop would have cut off the plain-text output.
 - Navigation: `↑`/`↓` or `j`/`k` move one row; `←`/`→` or `h`/`l` jump several rows at once; `PageUp`/`PageDown` scroll a page; `Home`/`g` and `End`/`G` jump to the start/end; `q`/`Esc`/`Ctrl-C` quit.
+- Search: `/` opens a search prompt; typed characters build the query, `Enter` confirms (jumping to the first match at or after the current row) and `Esc` cancels. A match is a row whose clean or dirty content contains the query (case-insensitive); `n`/`N` cycle to the next/previous match, wrapping around. The matched substring is highlighted on whichever side(s) contain it; the footer shows the query and match position (e.g. `2/4 matches`).
 
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
