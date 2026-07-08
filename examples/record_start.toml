@@ -1,0 +1,37 @@
+# Demonstrates record_start: splitting consecutive multi-line records with
+# no separator (blank line, "---", etc.) between them.
+#
+# Matches back-to-back blocks like:
+#   2024-01-15 09:30:00 ERROR NullPointerException
+#     at com.example.App.main(App.java:42)
+#   2024-01-15 09:31:00 ERROR IllegalStateException
+#     at com.example.Svc.run(Svc.java:7)
+#
+# A new record starts wherever a line begins with a timestamp — no
+# delimiter line is needed between records.
+
+[general]
+record_start = "^\\d{4}-\\d{2}-\\d{2}"
+
+[atoms]
+timestamp  = "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+level      = "INFO|WARN|ERROR"
+exception  = "[A-Za-z.]+"
+stacktrace = "  at .+"
+
+[[items]]
+name = "log_entry"
+[[items.parts]]
+atom = "timestamp"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "level"
+[[items.parts]]
+regex = " "
+[[items.parts]]
+atom = "exception"
+[[items.parts]]
+regex = "\\n"
+[[items.parts]]
+atom = "stacktrace"

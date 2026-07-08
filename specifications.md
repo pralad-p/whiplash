@@ -27,7 +27,10 @@ Whiplash compares two log files (“clean” and “dirty”) by parsing them in
   - Atom names whose extracted values are excluded from matching signatures for all items.
 - `delimiters` (string or list of strings, optional)
   - Regex(es) identifying delimiter lines that split the log into blocks.
-  - Without delimiters, every line is its own block (per-line records).
+  - Without delimiters or `record_start`, every line is its own block (per-line records).
+- `record_start` (string, optional)
+  - Regex matching the first line of a new record. A block ends (and a new one begins) right before any line matching this pattern, even with no delimiter line between records.
+  - Lets consecutive multi-line records be split by recognizing where the next one begins, instead of requiring an explicit separator. Can be combined with `delimiters`: either mechanism can end a block.
 
 ### `atoms`
 - A map of atom names to regex strings.
@@ -65,8 +68,10 @@ For each item:
 ## Parsing Logs
 - Input logs are read as UTF-8; invalid byte sequences are replaced rather than failing.
 - The log is split into blocks:
-  - With `general.delimiters` configured, blocks are separated by lines matching a delimiter regex (the delimiter lines themselves are discarded). Blocks may span multiple lines.
-  - Without delimiters, every line is its own block.
+  - With `general.delimiters` configured, a block ends at a line matching a delimiter regex (the delimiter line itself is discarded).
+  - With `general.record_start` configured, a block ends right before a line matching that regex (the matching line becomes the first line of the next block). Combinable with `delimiters` — either condition ends a block.
+  - With neither configured, every line is its own block.
+  - Blocks may span multiple lines under either mechanism.
 - For each block, item patterns are tried in config order; the first pattern that matches the **entire block** (start to end, trailing newlines excluded) wins.
 - If no pattern fully matches a block, the block's starting line is recorded as unparsed. Partial matches are never accepted.
 
@@ -101,7 +106,7 @@ Early stop:
 ## CLI Behavior
 Command:
 ```
-whiplash --config config.toml [--threshold N] [--max-failed N] [--validate] clean_log [dirty_log]
+whiplash --config config.toml [--threshold N] [--max-failed N] [--validate | --side-by-side] clean_log [dirty_log]
 ```
 
 Arguments:
@@ -111,6 +116,7 @@ Arguments:
   - `--threshold` (overrides `general.index_threshold`)
   - `--max-failed` (overrides `general.max_failed_items`)
   - `--validate` (validate `clean_log` against the config instead of comparing two logs)
+  - `--side-by-side` (open the interactive compare view instead of the default divergence output; mutually exclusive with `--validate`)
 
 ## Output
 
@@ -118,9 +124,17 @@ Arguments:
 - Prints each dirty item's `raw_line` in order for every `Match` event.
 - On the first `Extra` or `Missing` event, prints `--- DIVERGENCE ---` followed by a one-line description (dirty line and line number, or clean line and line number) and stops.
 - If comparison stopped early with no divergence printed, prints `--- STOPPED ---` followed by the stop reason.
+- Colored diagnostics (see `--validate` below) and top-level error messages auto-detect terminal support: colored on a TTY, plain when piped or when `NO_COLOR`/`CLICOLOR=0` is set.
 
 ### `--validate`
-- Prints `Processed N items` followed by either `Config.toml correct 🟢`, or on the first block with no matching pattern: the validation error, a diagnostic breakdown of the closest-matching item's parts, and `Validation failed, issue with Config.toml 🔴`. Exits with status `1` on failure.
+- Prints `Processed N items` followed by either `Config.toml correct 🟢`, or on the first block with no matching pattern: the validation error, a diagnostic breakdown of the closest-matching item's parts (colored: green for matched parts, red for the part that failed, dim for parts not yet attempted), and `Validation failed, issue with Config.toml 🔴`. Exits with status `1` on failure.
+
+### `--side-by-side`
+- Requires an interactive terminal (stdout must be a TTY); errors immediately otherwise.
+- Merges clean and dirty items into rows, in document order: a matched pair shares a row; an unmatched item gets its own row with the other side blank. Each row shows the same id number and a status icon on both sides (✓ matched at the same original index, ~ matched only via `--threshold`, ✗ no counterpart) so a shared id/icon signals a matching pair.
+- A minimap strip above the table shows one column per row (or, once there are more rows than columns, one column per bucket of rows, colored by the worst status in the bucket): green for an aligned match, gray for a threshold-shifted match (with a connecting line between the clean/dirty strips), red for no match. A live marker tracks the current viewport position on the minimap as you navigate.
+- Lays out the full comparison regardless of where `--max-failed` early-stop would have cut off the plain-text output.
+- Navigation: `↑`/`↓` or `j`/`k` move one row; `←`/`→` or `h`/`l` jump several rows at once; `PageUp`/`PageDown` scroll a page; `Home`/`g` and `End`/`G` jump to the start/end; `q`/`Esc`/`Ctrl-C` quit.
 
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
