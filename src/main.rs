@@ -71,11 +71,21 @@ struct RawConfig {
     items: Vec<RawItem>,
 }
 
+/// One regex, or a list of regexes any of which may match.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum DelimiterValue {
+enum PatternList {
     Single(String),
     List(Vec<String>),
+}
+
+impl PatternList {
+    fn as_slice(&self) -> &[String] {
+        match self {
+            PatternList::Single(s) => std::slice::from_ref(s),
+            PatternList::List(v) => v.as_slice(),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -83,8 +93,8 @@ struct RawGeneral {
     index_threshold: Option<usize>,
     max_failed_items: Option<usize>,
     blacklist_atoms: Option<Vec<String>>,
-    delimiters: Option<DelimiterValue>,
-    record_start: Option<String>,
+    delimiters: Option<PatternList>,
+    record_start: Option<PatternList>,
 }
 
 #[derive(Deserialize)]
@@ -118,11 +128,11 @@ struct Config {
     index_threshold: usize,
     max_failed_items: usize,
     delimiters: Vec<Regex>,
-    /// A line matching this pattern starts a new block, without needing a
-    /// delimiter line. Lets consecutive multi-line records be split by
-    /// recognizing where the next one begins (e.g. a timestamp at the start
-    /// of a line) instead of requiring a separator between them.
-    record_start: Option<Regex>,
+    /// A line matching any of these patterns starts a new block, without
+    /// needing a delimiter line. Lets consecutive multi-line records be
+    /// split by recognizing where the next one begins (e.g. a timestamp at
+    /// the start of a line) instead of requiring a separator between them.
+    record_start: Vec<Regex>,
     items: Vec<CompiledItem>,
 }
 
@@ -171,8 +181,8 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     Ok(Config {
         index_threshold: cli.threshold.or(general.index_threshold).unwrap_or(0),
         max_failed_items: cli.max_failed.or(general.max_failed_items).unwrap_or(0),
-        delimiters: compile_delimiters(&general)?,
-        record_start: compile_record_start(&general)?,
+        delimiters: compile_patterns(&general.delimiters, "delimiter")?,
+        record_start: compile_patterns(&general.record_start, "record_start")?,
         items,
     })
 }
@@ -184,23 +194,21 @@ fn is_delimiter_line(line_without_newline: &str, config: &Config) -> bool {
         .any(|re| re.is_match(line_without_newline))
 }
 
-fn compile_delimiters(general: &RawGeneral) -> Result<Vec<Regex>> {
-    let raw: &[String] = match &general.delimiters {
-        Some(DelimiterValue::Single(s)) => std::slice::from_ref(s),
-        Some(DelimiterValue::List(v)) => v,
-        None => &[],
-    };
-    raw.iter()
-        .map(|pat| Regex::new(pat).with_context(|| format!("invalid delimiter regex: {}", pat)))
-        .collect()
+fn is_record_start_line(line_without_newline: &str, config: &Config) -> bool {
+    config
+        .record_start
+        .iter()
+        .any(|re| re.is_match(line_without_newline))
 }
 
-fn compile_record_start(general: &RawGeneral) -> Result<Option<Regex>> {
-    general
-        .record_start
+fn compile_patterns(value: &Option<PatternList>, field_name: &str) -> Result<Vec<Regex>> {
+    value
         .as_ref()
-        .map(|pat| Regex::new(pat).with_context(|| format!("invalid record_start regex: {}", pat)))
-        .transpose()
+        .map(PatternList::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .map(|pat| Regex::new(pat).with_context(|| format!("invalid {field_name} regex: {pat}")))
+        .collect()
 }
 
 fn compile_item(
@@ -357,7 +365,7 @@ impl<'a> BlockSplitter<'a> {
     fn new(config: &'a Config) -> Self {
         BlockSplitter {
             config,
-            per_line: config.delimiters.is_empty() && config.record_start.is_none(),
+            per_line: config.delimiters.is_empty() && config.record_start.is_empty(),
             block: String::new(),
             block_start_line: 1,
             line_no: 1,
@@ -373,12 +381,7 @@ impl<'a> BlockSplitter<'a> {
         if is_delimiter_line(stripped, self.config) {
             completed = self.take();
         } else {
-            let starts_new_record = !self.block.is_empty()
-                && self
-                    .config
-                    .record_start
-                    .as_ref()
-                    .is_some_and(|re| re.is_match(stripped));
+            let starts_new_record = !self.block.is_empty() && is_record_start_line(stripped, self.config);
             if starts_new_record {
                 completed = self.take();
             }

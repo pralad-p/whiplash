@@ -40,8 +40,14 @@
           ]
         },
         "record_start": {
-          "description": "Regex matching the first line of a new record. Splits a block before any line matching this pattern, even without a delimiter line between records — for consecutive multi-line records with no separator. Can be combined with `delimiters`.",
-          "type": "string"
+          "description": "Regex(es) matching the first line of a new record; a block ends before any line matching any of them, even without a delimiter line between records — for consecutive multi-line records with no separator. Can be combined with `delimiters`.",
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          ]
         }
       }
     },
