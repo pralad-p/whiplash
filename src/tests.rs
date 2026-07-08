@@ -18,7 +18,6 @@ fn raw_item_with_parts(name: &str, parts: Vec<RawPart>) -> RawItem {
         name: name.into(),
         parts: Some(parts),
         flags: None,
-        ignore_atoms: None,
     }
 }
 
@@ -47,7 +46,7 @@ fn simple_config() -> Config {
     let atoms = make_atoms();
     let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw = raw_item_with_parts("log_entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -234,7 +233,7 @@ fn parse_log_record_start_splits_consecutive_multiline_records() {
         },
     ];
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -330,7 +329,7 @@ fn validate_record_start_error_reports_block_start_line() {
         },
     ];
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,
@@ -373,7 +372,7 @@ fn compile_item_with_parts_atom_and_regex() {
         },
     ];
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     assert!(item.pattern.is_match("INFO: hello world"));
     assert!(!item.pattern.is_match("INFO hello world"));
 }
@@ -383,7 +382,7 @@ fn compile_item_with_wildcard_regex_between_atoms() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level", "message"], None);
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     assert_eq!(item.name, "entry");
     assert!(item.pattern.is_match("INFO something happened"));
 }
@@ -393,7 +392,7 @@ fn compile_item_with_space_regex_between_atoms() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level", "message"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     assert!(item.pattern.is_match("ERROR crash"));
     // Joiner is literal space, so "ERROR\tcrash" should not match (tab instead of space)
     assert!(!item.pattern.is_match("ERROR\tcrash"));
@@ -404,7 +403,7 @@ fn compile_item_empty_name_rejected() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level"], None);
     let raw = raw_item_with_parts("", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
@@ -414,9 +413,8 @@ fn compile_item_no_parts_rejected() {
         name: "bad".into(),
         parts: None,
         flags: None,
-        ignore_atoms: None,
     };
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
@@ -428,14 +426,14 @@ fn compile_item_unknown_atom_in_part_rejected() {
         ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
 fn compile_item_empty_parts_rejected() {
     let atoms = make_atoms();
     let raw = raw_item_with_parts("entry", vec![]);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
@@ -447,7 +445,7 @@ fn compile_item_part_with_both_atom_and_regex_rejected() {
         ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
@@ -459,7 +457,7 @@ fn compile_item_part_with_neither_rejected() {
         ..Default::default()
     }];
     let raw = raw_item_with_parts("entry", parts);
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
@@ -468,7 +466,7 @@ fn compile_item_flags_ignorecase() {
     let parts = atom_parts(&["level"], None);
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     assert!(item.pattern.is_match("info"));
     assert!(item.pattern.is_match("INFO"));
 }
@@ -482,7 +480,7 @@ fn compile_item_flags_list() {
         "IGNORECASE".into(),
         "MULTILINE".into(),
     ]));
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     assert!(item.pattern.is_match("info"));
 }
 
@@ -492,18 +490,20 @@ fn compile_item_unknown_flag_rejected() {
     let parts = atom_parts(&["level"], None);
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("BADFLAG".into()));
-    assert!(compile_item(&raw, &atoms, &[]).is_err());
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
-fn compile_item_ignore_set_merges_blacklist_and_item() {
+fn compile_item_include_for_match_on_regex_part_rejected() {
     let atoms = make_atoms();
-    let parts = atom_parts(&["timestamp", "level"], Some(" "));
-    let mut raw = raw_item_with_parts("entry", parts);
-    raw.ignore_atoms = Some(vec!["level".into()]);
-    let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
-    assert!(item.ignore_set.contains(&"timestamp".to_string()));
-    assert!(item.ignore_set.contains(&"level".to_string()));
+    let parts = vec![RawPart {
+        atom: None,
+        regex: Some(" ".into()),
+        include_for_match: true,
+        ..Default::default()
+    }];
+    let raw = raw_item_with_parts("entry", parts);
+    assert!(compile_item(&raw, &atoms).is_err());
 }
 
 #[test]
@@ -511,7 +511,7 @@ fn compile_item_duplicate_atom_gets_unique_groups() {
     let atoms = make_atoms();
     let parts = atom_parts(&["level", "level"], Some(" "));
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     assert_eq!(item.capture_atoms.len(), 2);
     assert_ne!(item.capture_atoms[0].1, item.capture_atoms[1].1);
 }
@@ -542,7 +542,6 @@ fn config_toml_with_general() {
 [general]
 index_threshold = 5
 max_failed_items = 3
-blacklist_atoms = ["timestamp"]
 
 [atoms]
 level = "INFO"
@@ -556,7 +555,6 @@ atom = "level"
     let general = raw.general.unwrap();
     assert_eq!(general.index_threshold, Some(5));
     assert_eq!(general.max_failed_items, Some(3));
-    assert_eq!(general.blacklist_atoms.unwrap(), vec!["timestamp"]);
 }
 
 #[test]
@@ -668,6 +666,23 @@ regex = ": "
     assert_eq!(parts[1].regex.as_deref(), Some(": "));
 }
 
+#[test]
+fn config_toml_with_include_for_match() {
+    let toml_str = r#"
+[atoms]
+level = "INFO|WARN"
+
+[[items]]
+name = "entry"
+[[items.parts]]
+atom = "level"
+include_for_match = true
+"#;
+    let raw: RawConfig = toml::from_str(toml_str).unwrap();
+    let parts = raw.items[0].parts.as_ref().unwrap();
+    assert!(parts[0].include_for_match);
+}
+
 // ── parse_log (legacy + delimiter mode) ──────────────────────────────
 
 #[test]
@@ -718,24 +733,41 @@ fn parse_log_signature_includes_all_atoms() {
     assert_eq!(vals.len(), 3); // timestamp, level, message
 }
 
-#[test]
-fn parse_log_signature_excludes_ignored_atoms() {
-    let atoms = make_atoms();
-    let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
-    let mut raw = raw_item_with_parts("entry", parts);
-    raw.ignore_atoms = Some(vec!["timestamp".into()]);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
-    let config = Config {
+/// Wrap compiled items in a per-line config.
+fn config_with_items(items: Vec<CompiledItem>) -> Config {
+    Config {
         index_threshold: 0,
         max_failed_items: 0,
         delimiters: vec![],
         record_start: vec![],
-        items: vec![item],
-    };
+        items,
+    }
+}
+
+#[test]
+fn parse_log_signature_include_for_match_whitelists_marked_parts() {
+    let atoms = make_atoms();
+    let mut parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
+    parts[2].include_for_match = true; // level atom part
+    let raw = raw_item_with_parts("entry", parts);
+    let item = compile_item(&raw, &atoms).unwrap();
+    let config = config_with_items(vec![item]);
     let (items, _) = parse_log("2024-01-01 10:00:00 INFO hello\n", &config);
     let (_, ref vals) = items[0].signature;
-    assert_eq!(vals.len(), 2); // level, message only
-    assert_eq!(vals[0], "INFO");
+    assert_eq!(vals, &vec!["INFO".to_string()]); // timestamp, message excluded
+}
+
+#[test]
+fn parse_log_signature_include_for_match_is_per_occurrence() {
+    let atoms = make_atoms();
+    let mut parts = atom_parts(&["level", "level"], Some(" "));
+    parts[2].include_for_match = true; // second `level` occurrence only
+    let raw = raw_item_with_parts("entry", parts);
+    let item = compile_item(&raw, &atoms).unwrap();
+    let config = config_with_items(vec![item]);
+    let (items, _) = parse_log("INFO WARN\n", &config);
+    let (_, ref vals) = items[0].signature;
+    assert_eq!(vals, &vec!["WARN".to_string()]);
 }
 
 #[test]
@@ -1023,18 +1055,14 @@ fn integration_divergence_at_third_line() {
 }
 
 #[test]
-fn integration_blacklist_ignores_timestamp() {
+fn integration_include_for_match_ignores_timestamp() {
     let atoms = make_atoms();
-    let parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
+    let mut parts = atom_parts(&["timestamp", "level", "message"], Some(" "));
+    parts[2].include_for_match = true; // level
+    parts[4].include_for_match = true; // message
     let raw = raw_item_with_parts("entry", parts);
-    let item = compile_item(&raw, &atoms, &["timestamp".to_string()]).unwrap();
-    let config = Config {
-        index_threshold: 0,
-        max_failed_items: 0,
-        delimiters: vec![],
-        record_start: vec![],
-        items: vec![item],
-    };
+    let item = compile_item(&raw, &atoms).unwrap();
+    let config = config_with_items(vec![item]);
     let clean_log = "2024-01-01 10:00:00 INFO hello\n";
     let dirty_log = "2099-12-31 23:59:59 INFO hello\n";
     let (clean, _) = parse_log(clean_log, &config);
@@ -1194,7 +1222,7 @@ fn validate_multiline_item_counted() {
         },
     ];
     let raw = raw_item_with_parts("multiline_entry", parts);
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     // Multi-line items require delimiter mode; without delimiter lines in
     // the log the whole input is a single block.
     let config = Config {
@@ -1326,12 +1354,12 @@ fn diagnose_best_match_selection_multiple_items() {
     // Item 1: level + " " + message (3 parts)
     let parts1 = atom_parts(&["level", "message"], Some(" "));
     let raw1 = raw_item_with_parts("short_entry", parts1);
-    let item1 = compile_item(&raw1, &atoms, &[]).unwrap();
+    let item1 = compile_item(&raw1, &atoms).unwrap();
 
     // Item 2: timestamp + " " + level + " " + message (5 parts)
     let parts2 = atom_parts(&["timestamp", "level", "message"], Some(" "));
     let raw2 = raw_item_with_parts("full_entry", parts2);
-    let item2 = compile_item(&raw2, &atoms, &[]).unwrap();
+    let item2 = compile_item(&raw2, &atoms).unwrap();
 
     let config = Config {
         index_threshold: 0,
@@ -1357,7 +1385,7 @@ fn diagnose_with_flags_ignorecase() {
     let parts = atom_parts(&["level", "message"], Some(" "));
     let mut raw = raw_item_with_parts("entry", parts);
     raw.flags = Some(FlagValue::Single("IGNORECASE".into()));
-    let item = compile_item(&raw, &atoms, &[]).unwrap();
+    let item = compile_item(&raw, &atoms).unwrap();
     let config = Config {
         index_threshold: 0,
         max_failed_items: 0,

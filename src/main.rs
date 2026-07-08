@@ -65,6 +65,7 @@ struct Cli {
 // ── Config types (raw TOML deserialization) ──────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     general: Option<RawGeneral>,
     atoms: HashMap<String, String>,
@@ -89,10 +90,10 @@ impl PatternList {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawGeneral {
     index_threshold: Option<usize>,
     max_failed_items: Option<usize>,
-    blacklist_atoms: Option<Vec<String>>,
     delimiters: Option<PatternList>,
     record_start: Option<PatternList>,
 }
@@ -103,7 +104,6 @@ struct RawItem {
     name: String,
     parts: Option<Vec<RawPart>>,
     flags: Option<FlagValue>,
-    ignore_atoms: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +120,8 @@ struct RawPart {
     regex: Option<String>,
     #[serde(default)]
     optional: bool,
+    #[serde(default)]
+    include_for_match: bool,
 }
 
 // ── Resolved config ──────────────────────────────────────────────────
@@ -146,8 +148,10 @@ struct CompiledItem {
     pattern: Regex,
     /// Atom names that participate in this item's captures (in order).
     capture_atoms: Vec<(String, String)>, // (atom_name, capture_group_name)
-    /// Atoms to ignore in signature.
-    ignore_set: Vec<String>,
+    /// When the item opts into whitelist matching via `include_for_match`,
+    /// a per-capture mask (aligned with `capture_atoms`) selecting which
+    /// values enter the signature. `None` means all captured values do.
+    sig_include: Option<Vec<bool>>,
     /// Ordered parts for diagnostic output on validation failure.
     diagnostic_parts: Vec<DiagnosticPart>,
     /// Flags prefix e.g. "(?ims)" or "", needed to reconstruct partial patterns.
@@ -168,12 +172,11 @@ fn load_config(path: &PathBuf, cli: &Cli) -> Result<Config> {
     }
 
     let general = raw.general.unwrap_or_default();
-    let blacklist = general.blacklist_atoms.clone().unwrap_or_default();
     let items = raw
         .items
         .iter()
         .map(|ri| {
-            compile_item(ri, &raw.atoms, &blacklist)
+            compile_item(ri, &raw.atoms)
                 .with_context(|| format!("compiling item '{}'", ri.name))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -211,11 +214,7 @@ fn compile_patterns(value: &Option<PatternList>, field_name: &str) -> Result<Vec
         .collect()
 }
 
-fn compile_item(
-    raw: &RawItem,
-    atoms: &HashMap<String, String>,
-    blacklist: &[String],
-) -> Result<CompiledItem> {
+fn compile_item(raw: &RawItem, atoms: &HashMap<String, String>) -> Result<CompiledItem> {
     if raw.name.is_empty() {
         bail!("item name must be non-empty");
     }
@@ -245,8 +244,13 @@ fn compile_item(
         format!("(?{})", flag_chars)
     };
 
+    // Any `include_for_match` part switches the item to whitelist matching:
+    // only marked parts enter the signature, instead of every captured value.
+    let whitelist = parts.iter().any(|p| p.include_for_match);
+
     let mut pattern_str = flags_prefix.clone();
     let mut capture_atoms: Vec<(String, String)> = Vec::new();
+    let mut include_mask: Vec<bool> = Vec::new();
     let mut ordinal_counter: HashMap<String, usize> = HashMap::new();
     let mut diagnostic_parts: Vec<DiagnosticPart> = Vec::new();
 
@@ -267,6 +271,7 @@ fn compile_item(
                 let group_name = format!("{}__{}", atom_name, ord);
                 *ord += 1;
                 capture_atoms.push((atom_name.clone(), group_name.clone()));
+                include_mask.push(part.include_for_match);
                 let fragment = wrap(format!("(?P<{}>{})", group_name, atom_regex));
                 pattern_str.push_str(&fragment);
                 diagnostic_parts.push(DiagnosticPart {
@@ -275,6 +280,12 @@ fn compile_item(
                 });
             }
             (None, Some(regex_frag)) => {
+                if part.include_for_match {
+                    bail!(
+                        "`include_for_match` is only valid on `atom` parts (regex parts capture no value): {}",
+                        regex_frag
+                    );
+                }
                 pattern_str.push_str(&wrap(regex_frag.clone()));
                 diagnostic_parts.push(DiagnosticPart {
                     label: "(joining-regex)".to_string(),
@@ -290,14 +301,11 @@ fn compile_item(
     let pattern = Regex::new(&pattern_str)
         .with_context(|| format!("invalid regex for item '{}'", raw.name))?;
 
-    let mut ignore_set = blacklist.to_vec();
-    ignore_set.extend(raw.ignore_atoms.iter().flatten().cloned());
-
     Ok(CompiledItem {
         name: raw.name.clone(),
         pattern,
         capture_atoms,
-        ignore_set,
+        sig_include: whitelist.then_some(include_mask),
         diagnostic_parts,
         flags_prefix,
     })
@@ -323,14 +331,18 @@ fn item_from_caps(
     let mut atom_values: HashMap<String, Vec<String>> = HashMap::new();
     let mut sig_values = Vec::new();
 
-    for (atom_name, group_name) in &compiled.capture_atoms {
+    for (idx, (atom_name, group_name)) in compiled.capture_atoms.iter().enumerate() {
         if let Some(val) = caps.name(group_name) {
             let val_str = val.as_str().to_string();
             atom_values
                 .entry(atom_name.clone())
                 .or_default()
                 .push(val_str.clone());
-            if !compiled.ignore_set.contains(atom_name) {
+            let in_signature = compiled
+                .sig_include
+                .as_ref()
+                .is_none_or(|mask| mask[idx]);
+            if in_signature {
                 sig_values.push(val_str);
             }
         }

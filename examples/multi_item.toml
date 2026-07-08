@@ -19,52 +19,58 @@ message   = ".+"
 
 # Most specific: health-check requests (exact path)
 # e.g.: 2024-01-15 09:30:00 GET /healthz 200
+# Timestamps vary between runs, so each item marks everything else
+# with include_for_match to keep timestamps out of the signature.
 [[items]]
 name = "health_check"
-ignore_atoms = ["timestamp"]
 [[items.parts]]
 atom = "timestamp"
 [[items.parts]]
 regex = " "
 [[items.parts]]
 atom = "method"
+include_for_match = true
 [[items.parts]]
 regex = " /healthz "
 [[items.parts]]
 atom = "status"
+include_for_match = true
 
 # HTTP requests (any path)
 # e.g.: 2024-01-15 09:30:00 POST /api/users 201
 [[items]]
 name = "http_request"
-ignore_atoms = ["timestamp"]
 [[items.parts]]
 atom = "timestamp"
 [[items.parts]]
 regex = " "
 [[items.parts]]
 atom = "method"
+include_for_match = true
 [[items.parts]]
 regex = " "
 [[items.parts]]
 atom = "path"
+include_for_match = true
 [[items.parts]]
 regex = " "
 [[items.parts]]
 atom = "status"
+include_for_match = true
 
 # Catch-all: general log messages
 # e.g.: 2024-01-15 09:30:00 INFO Server started on port 8080
 [[items]]
 name = "general_log"
-ignore_atoms = ["timestamp"]
 [[items.parts]]
 atom = "timestamp"
 [[items.parts]]
 regex = " "
 [[items.parts]]
 atom = "level"
+include_for_match = true
 [[items.parts]]
 regex = " "
 [[items.parts]]
 atom = "message"
+include_for_match = true
