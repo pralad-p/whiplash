@@ -23,8 +23,6 @@ Whiplash compares two log files (“clean” and “dirty”) by parsing them in
   - Maximum offset allowed between clean and dirty item indices when matching.
 - `max_failed_items` (int, default `0`, must be >= 0)
   - Maximum number of consecutive failures before stopping. `0` disables early stop.
-- `blacklist_atoms` (list of strings, optional)
-  - Atom names whose extracted values are excluded from matching signatures for all items.
 - `delimiters` (string or list of strings, optional)
   - Regex(es) identifying delimiter lines that split the log into blocks.
   - Without delimiters or `record_start`, every line is its own block (per-line records).
@@ -51,19 +49,24 @@ Pattern definition:
   - `atom = "atom_name"` (must reference a name defined in `atoms`)
   - `regex = "..."` (raw regex fragment)
 - `parts` are concatenated in order to form the full regex.
+- `optional` (bool, default `false`)
+  - The part may be absent from the log entry (e.g. records whose trailing lines only sometimes appear); its absence does not fail the match.
+- `include_for_match` (bool, default `false`, atom parts only)
+  - Opts the item into whitelist matching: when any part of an item sets it, the item's signature contains **only** the values of the marked parts, instead of all captured values.
+  - Per-occurrence: the same atom used twice can be marked on one occurrence only.
+  - Setting it on a `regex` part (which captures no value) is a config error.
+  - Distinct from `optional`: `optional` controls whether the part must be present to parse; `include_for_match` controls whether its value participates in cross-record matching.
 
 #### Additional item fields
 - `flags` (string or list of strings, optional)
   - Regex flags by name: `IGNORECASE`, `MULTILINE`, `DOTALL`.
-- `ignore_atoms` (list of strings, optional)
-  - Atom names whose values are excluded from the item's signature.
 
 ## Pattern Compilation
 For each item:
 1. Build a full regex by concatenating `parts` in order.
 2. Atom parts become named capture groups with unique names (e.g., `<name__ordinal>`).
 3. The regex is compiled with the configured flags.
-4. An item's effective ignore set is `blacklist_atoms ∪ ignore_atoms`.
+4. If any part sets `include_for_match`, the item's signature is built from the marked parts only (whitelist mode); otherwise every captured value enters the signature.
 
 ## Parsing Logs
 - Input logs are read as UTF-8; invalid byte sequences are replaced rather than failing.
@@ -82,7 +85,7 @@ For each matched item:
 - `raw_line`: matched text, with trailing newlines stripped.
 - `atom_values`: map of atom name to list of captured values.
 - `signature`: tuple used for comparison:
-  - `(item_name, tuple(values))`, where `values` are captured atom values **excluding** ignored atoms.
+  - `(item_name, tuple(values))`, where `values` are all captured atom values — or, when the item uses `include_for_match`, **only** the values of the marked parts.
 
 ## Comparison Algorithm
 Inputs: `clean_items`, `dirty_items`, `threshold`, `max_failed_items`.
@@ -140,7 +143,7 @@ Arguments:
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
 - For matching, clean items are authoritative; dirty items are matched to them within the index threshold.
-- Atom blacklisting and ignore lists only affect signatures (matching), not parsing.
+- `include_for_match` only affects signatures (matching), not parsing.
 
 ## Version
 - The implementation should expose a single application version string in one place.

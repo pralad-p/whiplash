@@ -24,11 +24,6 @@
           "minimum": 0,
           "default": 0
         },
-        "blacklist_atoms": {
-          "description": "Atom names whose extracted values are excluded from matching signatures for all items.",
-          "type": "array",
-          "items": { "type": "string" }
-        },
         "delimiters": {
           "description": "Regex(es) identifying delimiter lines that split the log into blocks; an item pattern must match a whole block. Without delimiters, every line is its own block.",
           "oneOf": [
@@ -95,6 +90,11 @@
                   "description": "If true, this part may be absent from the log entry.",
                   "type": "boolean",
                   "default": false
+                },
+                "include_for_match": {
+                  "description": "Atom parts only. If any part of an item sets this, the item's matching signature contains only the marked parts' values (whitelist), instead of all captured values.",
+                  "type": "boolean",
+                  "default": false
                 }
               }
             }
@@ -108,11 +108,6 @@
                 "items": { "type": "string" }
               }
             ]
-          },
-          "ignore_atoms": {
-            "description": "Atom names whose values are excluded from this item's matching signature.",
-            "type": "array",
-            "items": { "type": "string" }
           }
         }
       }
