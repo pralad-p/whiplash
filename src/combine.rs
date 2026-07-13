@@ -15,7 +15,9 @@
 //! `timestamp` capture when present, otherwise the complete match.
 
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -138,6 +140,10 @@ fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
+fn format_timestamp(ts: &DateTime<Utc>) -> String {
+    ts.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
 // ── Records ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -234,6 +240,163 @@ pub(crate) fn render(records: &[Record], inputs: &[InputSpec]) -> String {
     out
 }
 
+// ── Selectors & trimming ─────────────────────────────────────────────
+
+enum Selector {
+    Timestamp(DateTime<Utc>),
+    Pattern(Regex),
+}
+
+/// A selector is an exact timestamp when it parses as one, otherwise a
+/// regex matched against record marker lines (before the label prefix).
+fn parse_selector(text: &str) -> Result<Selector> {
+    if let Some(ts) = parse_timestamp(text) {
+        return Ok(Selector::Timestamp(ts));
+    }
+    Regex::new(text)
+        .map(Selector::Pattern)
+        .with_context(|| format!("selector '{}' is neither a timestamp nor a valid regex", text))
+}
+
+/// Resolve `selector_text` to the index of a single record in the merged
+/// list. A unique match resolves directly; multiple matches are offered in
+/// fzf for the user to pick the exact occurrence.
+fn resolve_selector(
+    records: &[Record],
+    inputs: &[InputSpec],
+    selector_text: &str,
+    flag: &str,
+) -> Result<usize> {
+    let selector = parse_selector(selector_text).with_context(|| format!("{flag}: bad selector"))?;
+    let candidates: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| match &selector {
+            Selector::Timestamp(ts) => r.timestamp == *ts,
+            Selector::Pattern(re) => re.is_match(&r.lines[0]),
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    match candidates.len() {
+        0 => bail!("{}: selector '{}' matched no records", flag, selector_text),
+        1 => Ok(candidates[0]),
+        _ => pick_with_fzf(records, inputs, &candidates, selector_text, flag),
+    }
+}
+
+/// Offer ambiguous candidates in fzf. Rows carry the record index in a
+/// hidden first field so identical display text still selects the right
+/// record. `WHIPLASH_FZF` overrides the fzf binary (used by tests).
+fn pick_with_fzf(
+    records: &[Record],
+    inputs: &[InputSpec],
+    candidates: &[usize],
+    selector_text: &str,
+    flag: &str,
+) -> Result<usize> {
+    let override_cmd = std::env::var("WHIPLASH_FZF").ok();
+    if override_cmd.is_none() && !std::io::stderr().is_terminal() {
+        bail!(
+            "{}: selector '{}' matched {} records and no interactive terminal is available to disambiguate",
+            flag,
+            selector_text,
+            candidates.len()
+        );
+    }
+    let fzf_cmd = override_cmd.unwrap_or_else(|| "fzf".to_string());
+
+    let mut child = Command::new(&fzf_cmd)
+        .args(["--delimiter", "\t", "--with-nth", "2.."])
+        .arg("--prompt")
+        .arg(format!("{flag}> "))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to launch '{}' (is fzf installed?)", fzf_cmd))?;
+
+    {
+        let stdin = child.stdin.as_mut().expect("child stdin was piped");
+        for &idx in candidates {
+            let record = &records[idx];
+            writeln!(
+                stdin,
+                "{}\t{}\t[{}]\t{}",
+                idx,
+                format_timestamp(&record.timestamp),
+                inputs[record.source].label,
+                record.lines[0]
+            )
+            .context("failed to write candidates to fzf")?;
+        }
+    }
+
+    let output = child.wait_with_output().context("failed to wait for fzf")?;
+    if !output.status.success() {
+        bail!("{}: fzf selection for '{}' was cancelled or failed", flag, selector_text);
+    }
+    let selected = String::from_utf8_lossy(&output.stdout);
+    let idx: usize = selected
+        .trim_end_matches(['\n', '\r'])
+        .split('\t')
+        .next()
+        .unwrap_or("")
+        .parse()
+        .map_err(|_| anyhow!("{}: unexpected fzf output '{}'", flag, selected.trim_end()))?;
+    if !candidates.contains(&idx) {
+        bail!("{}: fzf returned a row outside the candidate set", flag);
+    }
+    Ok(idx)
+}
+
+pub(crate) struct TrimSpec<'a> {
+    pub delete_before: Option<&'a str>,
+    pub delete_after: Option<&'a str>,
+    /// (start, end); mutually exclusive with the other two (clap-enforced).
+    pub keep_between: Option<(&'a str, &'a str)>,
+}
+
+/// Apply record-aware trimming: resolve boundary selectors against the
+/// merged records and keep the inclusive range they describe. Boundary
+/// records are always retained.
+pub(crate) fn apply_trim(
+    records: Vec<Record>,
+    inputs: &[InputSpec],
+    trim: &TrimSpec,
+) -> Result<Vec<Record>> {
+    let (start_sel, end_sel) = match trim.keep_between {
+        Some((a, b)) => (Some((a, "--keep-between (start)")), Some((b, "--keep-between (end)"))),
+        None => (
+            trim.delete_before.map(|s| (s, "--delete-before")),
+            trim.delete_after.map(|s| (s, "--delete-after")),
+        ),
+    };
+    if start_sel.is_none() && end_sel.is_none() {
+        return Ok(records);
+    }
+
+    let start = start_sel
+        .map(|(s, flag)| resolve_selector(&records, inputs, s, flag))
+        .transpose()?;
+    let end = end_sel
+        .map(|(s, flag)| resolve_selector(&records, inputs, s, flag))
+        .transpose()?;
+
+    if let (Some(s), Some(e)) = (start, end) {
+        if s > e {
+            bail!(
+                "selected start record ({}) occurs after selected end record ({})",
+                format_timestamp(&records[s].timestamp),
+                format_timestamp(&records[e].timestamp)
+            );
+        }
+    }
+
+    let lo = start.unwrap_or(0);
+    let hi = end.map_or(records.len(), |e| e + 1);
+    Ok(records.into_iter().take(hi).skip(lo).collect())
+}
+
 // ── Output ───────────────────────────────────────────────────────────
 
 /// Write atomically: everything goes to a sibling temp file which replaces
@@ -268,6 +431,15 @@ pub(crate) fn run(cli: &crate::Cli) -> Result<()> {
         .context("--combine requires --output <PATH>")?;
 
     let records = merge_records(&inputs)?;
+    let trim = TrimSpec {
+        delete_before: cli.delete_before.as_deref(),
+        delete_after: cli.delete_after.as_deref(),
+        keep_between: cli
+            .keep_between
+            .as_ref()
+            .map(|kb| (kb[0].as_str(), kb[1].as_str())),
+    };
+    let records = apply_trim(records, &inputs, &trim)?;
     write_output(output, &render(&records, &inputs))
 }
 
@@ -412,4 +584,101 @@ mod tests {
         assert_eq!(render(&recs, &inputs), "[A] a1\n[A] a2\n[B] b1\n");
     }
 
+    // ── Selectors & trimming ─────────────────────────────────────────
+
+    fn sample_records() -> (Vec<Record>, Vec<InputSpec>) {
+        let recs = vec![
+            record("2026-07-13T09:00:00Z", 0, &["09:00 start"]),
+            record("2026-07-13T09:01:00Z", 1, &["09:01 job", "  detail"]),
+            record("2026-07-13T09:02:00Z", 0, &["09:02 middle"]),
+            record("2026-07-13T09:03:00Z", 1, &["09:03 done"]),
+        ];
+        (recs, specs(&["A", "B"]))
+    }
+
+    fn trim(
+        records: Vec<Record>,
+        inputs: &[InputSpec],
+        before: Option<&str>,
+        after: Option<&str>,
+        between: Option<(&str, &str)>,
+    ) -> Result<Vec<Record>> {
+        apply_trim(
+            records,
+            inputs,
+            &TrimSpec {
+                delete_before: before,
+                delete_after: after,
+                keep_between: between,
+            },
+        )
+    }
+
+    #[test]
+    fn delete_before_retains_boundary() {
+        let (recs, inputs) = sample_records();
+        let out = trim(recs, &inputs, Some("2026-07-13T09:01:00Z"), None, None).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].lines[0], "09:01 job");
+    }
+
+    #[test]
+    fn delete_after_retains_boundary() {
+        let (recs, inputs) = sample_records();
+        let out = trim(recs, &inputs, None, Some("middle$"), None).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.last().unwrap().lines[0], "09:02 middle");
+    }
+
+    #[test]
+    fn before_and_after_combine_inclusively() {
+        let (recs, inputs) = sample_records();
+        let out = trim(
+            recs,
+            &inputs,
+            Some("2026-07-13T09:01:00Z"),
+            Some("2026-07-13T09:02:00Z"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].lines, vec!["09:01 job", "  detail"]);
+        assert_eq!(out[1].lines[0], "09:02 middle");
+    }
+
+    #[test]
+    fn keep_between_is_inclusive() {
+        let (recs, inputs) = sample_records();
+        let out = trim(recs, &inputs, None, None, Some(("^09:01", "^09:02"))).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn reversed_range_is_rejected() {
+        let (recs, inputs) = sample_records();
+        let err = trim(recs, &inputs, None, None, Some(("^09:03", "^09:00"))).unwrap_err();
+        assert!(err.to_string().contains("occurs after"));
+    }
+
+    #[test]
+    fn selector_no_match_is_an_error() {
+        let (recs, inputs) = sample_records();
+        let err = trim(recs, &inputs, Some("no-such-line"), None, None).unwrap_err();
+        assert!(err.to_string().contains("matched no records"));
+    }
+
+    #[test]
+    fn selector_invalid_regex_is_an_error() {
+        let (recs, inputs) = sample_records();
+        let err = trim(recs, &inputs, Some("(unclosed"), None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("neither a timestamp nor a valid regex"));
+    }
+
+    #[test]
+    fn selectors_match_marker_lines_not_continuations() {
+        let (recs, inputs) = sample_records();
+        // "detail" appears only on a continuation line, so no record matches.
+        let err = trim(recs, &inputs, Some("detail"), None, None).unwrap_err();
+        assert!(err.to_string().contains("matched no records"));
+    }
 }

@@ -37,13 +37,18 @@ fn style(code: &str, text: &str) -> String {
 COMBINE MODE:
     whiplash --irregular --combine \\
         --file-label API api.log --file-label WORKER worker.log \\
-        --output case.log
+        --output case.log [--delete-before <SEL>] [--delete-after <SEL>] \\
+        [--keep-between <START> <END>]
 
     Merges records from two or more irregular logs chronologically. Each
     input's first line must be a metadata header such as:
         { marker_regex : \"^(?<timestamp>\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z)\" }
     Combine mode is incompatible with comparison and validation flags
-    (--config, --validate, --side-by-side, --threshold, --max-failed).")]
+    (--config, --validate, --side-by-side, --threshold, --max-failed).
+
+    A trimming <SEL>ECTOR is an exact record timestamp, or a regex matched
+    against record marker lines (before the [LABEL] prefix is added).
+    Ambiguous selectors open fzf to pick the exact record.")]
 struct Cli {
     /// Path to the TOML configuration file
     #[arg(long, required_unless_present = "combine")]
@@ -86,6 +91,18 @@ struct Cli {
     /// Output path for the combined log (required with --combine)
     #[arg(long, requires = "combine")]
     output: Option<PathBuf>,
+
+    /// Delete records strictly before the selected record (retains it)
+    #[arg(long = "delete-before", value_name = "SELECTOR", requires = "combine", conflicts_with = "keep_between")]
+    delete_before: Option<String>,
+
+    /// Delete records strictly after the selected record (retains it)
+    #[arg(long = "delete-after", value_name = "SELECTOR", requires = "combine", conflicts_with = "keep_between")]
+    delete_after: Option<String>,
+
+    /// Keep the two selected records and everything between them
+    #[arg(long = "keep-between", num_args = 2, value_names = ["START", "END"], requires = "combine")]
+    keep_between: Option<Vec<String>>,
 
     /// Clean (reference) log file
     #[arg(required_unless_present = "combine")]

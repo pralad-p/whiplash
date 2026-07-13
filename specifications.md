@@ -128,7 +128,9 @@ Command:
 whiplash --irregular --combine \
   --file-label API api.log \
   --file-label WORKER worker.log \
-  --output case.log
+  --output case.log \
+  [--delete-before <SELECTOR>] [--delete-after <SELECTOR>] \
+  [--keep-between <START> <END>]
 ```
 
 Merges records from multiple irregular log files into one chronological case log **without** parsing them into the configured item types.
@@ -162,6 +164,41 @@ Records from all inputs are merged by ascending timestamp. Records with equal ti
 continuation line from the same record
 [WORKER] 2026-07-13T09:42:01.240Z job received
 ```
+
+### Record-aware trimming
+Trimming runs after records are extracted and chronologically merged, but before labels are rendered and `--output` is written. It never splits a multiline record and preserves chronological order, labels, and newline behavior.
+
+- `--delete-before X` — delete records strictly before X; retain X.
+- `--delete-after X` — delete records strictly after X; retain X.
+- Both together retain the inclusive range between the two selected records.
+- `--keep-between A B` — shorthand for that inclusive range (takes exactly two selectors); mutually exclusive with the other two flags.
+- A range whose selected start occurs after its selected end is rejected.
+
+#### Selectors
+A selector is either:
+- an exact timestamp (any accepted key format) matched against records' extracted marker timestamps; or
+- a regex matched against record marker lines, before the `[LABEL]` prefix is added.
+
+Text that parses as a timestamp is treated as a timestamp; anything else must be a valid regex. A selector matching exactly one record resolves directly. When a selector matches multiple records, the candidates are offered in `fzf` (rows show timestamp, source label, and marker-line text; a hidden per-record identity field guarantees the right record is selected even when display text is duplicated). No match, an invalid regex, a cancelled or unavailable `fzf`, and an ambiguous selector without an interactive terminal are all errors — and never leave a partial output file. The `WHIPLASH_FZF` environment variable overrides the `fzf` binary (used for testing).
+
+## Output
+
+### Comparison (`clean_log` and `dirty_log` given)
+- Prints each dirty item's `raw_line` in order for every `Match` event.
+- On the first `Extra` or `Missing` event, prints `--- DIVERGENCE ---` followed by a one-line description (dirty line and line number, or clean line and line number) and stops.
+- If comparison stopped early with no divergence printed, prints `--- STOPPED ---` followed by the stop reason.
+- Colored diagnostics (see `--validate` below) and top-level error messages auto-detect terminal support: colored on a TTY, plain when piped or when `NO_COLOR`/`CLICOLOR=0` is set.
+
+### `--validate`
+- Prints `Processed N items` followed by either `Config.toml correct 🟢`, or on the first block with no matching pattern: the validation error, a diagnostic breakdown of the closest-matching item's parts (colored: green for matched parts, red for the part that failed, dim for parts not yet attempted), and `Validation failed, issue with Config.toml 🔴`. Exits with status `1` on failure.
+
+### `--side-by-side`
+- Requires an interactive terminal (stdout must be a TTY); errors immediately otherwise.
+- Merges clean and dirty items into rows, in document order: a matched pair shares a row; an unmatched item gets its own row with the other side blank. Each row shows the same id number and a status icon on both sides (✓ matched at the same original index, ~ matched only via `--threshold`, ✗ no counterpart) so a shared id/icon signals a matching pair.
+- A minimap strip above the table shows one column per row (or, once there are more rows than columns, one column per bucket of rows, colored by the worst status in the bucket): green for an aligned match, gray for a threshold-shifted match (with a connecting line between the clean/dirty strips), red for no match. A live marker tracks the current viewport position on the minimap as you navigate.
+- Lays out the full comparison regardless of where `--max-failed` early-stop would have cut off the plain-text output.
+- Navigation: `↑`/`↓` or `j`/`k` move one row; `←`/`→` or `h`/`l` jump several rows at once; `PageUp`/`PageDown` scroll a page; `Home`/`g` and `End`/`G` jump to the start/end; `q`/`Esc`/`Ctrl-C` quit.
+- Search: `/` opens a search prompt; typed characters build the query, `Enter` confirms (jumping to the first match at or after the current row) and `Esc` cancels. A match is a row whose clean or dirty content contains the query (case-insensitive); `n`/`N` cycle to the next/previous match, wrapping around. The matched substring is highlighted on whichever side(s) contain it; the footer shows the query and match position (e.g. `2/4 matches`).
 
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
