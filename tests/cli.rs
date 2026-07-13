@@ -1,5 +1,5 @@
 //! CLI integration tests for the irregular combine mode
-//! (`--irregular --combine`).
+//! (`--irregular --combine`) and its record-aware trimming flags.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -245,4 +245,206 @@ fn combine_requires_irregular_and_conflicts_with_config() {
         .unwrap();
     assert!(!output.status.success());
     assert!(stderr_of(&output).contains("cannot be used with"));
+}
+
+// ── Trimming (#15) ───────────────────────────────────────────────────
+
+/// Merged order for `standard_inputs`:
+///   1. [WORKER] job received   (09:42:01)
+///   2. [API] request started   (09:42:01.120, multiline)
+///   3. [WORKER] job running    (09:42:02)
+///   4. [API] request finished  (09:42:03)
+#[test]
+fn delete_before_exact_timestamp_retains_boundary() {
+    let dir = tmpdir("trim_delete_before");
+    let (api, worker) = standard_inputs(&dir);
+    let (output, out_path) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &["--delete-before", "2026-07-13T09:42:01.120Z"],
+    );
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let combined = fs::read_to_string(out_path).unwrap();
+    assert!(combined.starts_with("[API] 2026-07-13T09:42:01.120Z request started\n"));
+    assert!(!combined.contains("job received"));
+    assert!(combined.contains("continuation line two"));
+    assert!(combined.contains("request finished"));
+}
+
+#[test]
+fn delete_after_regex_retains_boundary() {
+    let dir = tmpdir("trim_delete_after");
+    let (api, worker) = standard_inputs(&dir);
+    let (output, out_path) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &["--delete-after", "job running"],
+    );
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let combined = fs::read_to_string(out_path).unwrap();
+    assert!(combined.ends_with("[WORKER] [2026-07-13 09:42:02] job running\n"));
+    assert!(!combined.contains("request finished"));
+    assert!(combined.contains("job received"));
+}
+
+#[test]
+fn delete_before_and_after_combine_to_inclusive_range() {
+    let dir = tmpdir("trim_range");
+    let (api, worker) = standard_inputs(&dir);
+    let (output, out_path) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &[
+            "--delete-before",
+            "request started",
+            "--delete-after",
+            "job running",
+        ],
+    );
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    assert_eq!(
+        fs::read_to_string(out_path).unwrap(),
+        "[API] 2026-07-13T09:42:01.120Z request started\n\
+         continuation line one\n\
+         continuation line two\n\
+         [WORKER] [2026-07-13 09:42:02] job running\n"
+    );
+}
+
+#[test]
+fn keep_between_is_inclusive_shorthand() {
+    let dir = tmpdir("trim_keep_between");
+    let (api, worker) = standard_inputs(&dir);
+    let (output, out_path) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &["--keep-between", "request started", "job running"],
+    );
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let combined = fs::read_to_string(out_path).unwrap();
+    assert!(combined.starts_with("[API] 2026-07-13T09:42:01.120Z request started\n"));
+    assert!(combined.ends_with("[WORKER] [2026-07-13 09:42:02] job running\n"));
+}
+
+#[test]
+fn keep_between_conflicts_with_delete_flags() {
+    let dir = tmpdir("trim_conflict");
+    let (api, worker) = standard_inputs(&dir);
+    let (output, _) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &[
+            "--keep-between",
+            "a",
+            "b",
+            "--delete-before",
+            "c",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("cannot be used with"));
+}
+
+#[test]
+fn reversed_range_is_rejected_without_touching_output() {
+    let dir = tmpdir("trim_reversed");
+    let (api, worker) = standard_inputs(&dir);
+    let out_path = dir.join("case.log");
+    fs::write(&out_path, "SENTINEL\n").unwrap();
+
+    let (output, _) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &["--keep-between", "request finished", "job received"],
+    );
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("occurs after"));
+    assert_eq!(fs::read_to_string(&out_path).unwrap(), "SENTINEL\n");
+}
+
+#[test]
+fn selector_without_match_is_an_error() {
+    let dir = tmpdir("trim_no_match");
+    let (api, worker) = standard_inputs(&dir);
+    let (output, _) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &["--delete-before", "never appears anywhere"],
+    );
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("matched no records"));
+}
+
+#[test]
+fn ambiguous_selector_without_terminal_is_an_error() {
+    let dir = tmpdir("trim_non_interactive");
+    let (api, worker) = standard_inputs(&dir);
+    // "job" matches both WORKER records; stderr is piped, so no fzf.
+    let (output, _) = combine(
+        &dir,
+        &[("API", &api), ("WORKER", &worker)],
+        &["--delete-before", "job"],
+    );
+    assert!(!output.status.success());
+    let err = stderr_of(&output);
+    assert!(err.contains("no interactive terminal"), "stderr: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_selector_resolves_via_fzf() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmpdir("trim_fzf");
+    let (api, worker) = standard_inputs(&dir);
+
+    // Fake fzf: always pick the second candidate row ("job running").
+    let script = dir.join("fake-fzf");
+    fs::write(&script, "#!/bin/sh\nhead -n 2 | tail -n 1\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out_path = dir.join("case.log");
+    let output = Command::new(bin())
+        .env("WHIPLASH_FZF", &script)
+        .args(["--irregular", "--combine", "--file-label", "API"])
+        .arg(&api)
+        .args(["--file-label", "WORKER"])
+        .arg(&worker)
+        .arg("--output")
+        .arg(&out_path)
+        .args(["--delete-before", "job"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+
+    let combined = fs::read_to_string(out_path).unwrap();
+    assert!(combined.starts_with("[WORKER] [2026-07-13 09:42:02] job running\n"));
+    assert!(!combined.contains("request started"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_fzf_is_an_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmpdir("trim_fzf_cancel");
+    let (api, worker) = standard_inputs(&dir);
+
+    let script = dir.join("fake-fzf");
+    fs::write(&script, "#!/bin/sh\ncat > /dev/null\nexit 130\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(bin())
+        .env("WHIPLASH_FZF", &script)
+        .args(["--irregular", "--combine", "--file-label", "API"])
+        .arg(&api)
+        .args(["--file-label", "WORKER"])
+        .arg(&worker)
+        .arg("--output")
+        .arg(dir.join("case.log"))
+        .args(["--delete-before", "job"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("cancelled"));
 }
