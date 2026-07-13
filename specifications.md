@@ -114,31 +114,54 @@ whiplash --config config.toml [--threshold N] [--max-failed N] [--validate | --s
 
 Arguments:
 - Positional: `clean_log` (required), `dirty_log` (required unless `--validate` is set)
-- Required: `--config` (path to TOML)
+- Required: `--config` (path to TOML; not used in combine mode)
 - Optional:
   - `--threshold` (overrides `general.index_threshold`)
   - `--max-failed` (overrides `general.max_failed_items`)
   - `--validate` (validate `clean_log` against the config instead of comparing two logs)
   - `--side-by-side` (open the interactive compare view instead of the default divergence output; mutually exclusive with `--validate`)
 
-## Output
+## Irregular Combine Mode
 
-### Comparison (`clean_log` and `dirty_log` given)
-- Prints each dirty item's `raw_line` in order for every `Match` event.
-- On the first `Extra` or `Missing` event, prints `--- DIVERGENCE ---` followed by a one-line description (dirty line and line number, or clean line and line number) and stops.
-- If comparison stopped early with no divergence printed, prints `--- STOPPED ---` followed by the stop reason.
-- Colored diagnostics (see `--validate` below) and top-level error messages auto-detect terminal support: colored on a TTY, plain when piped or when `NO_COLOR`/`CLICOLOR=0` is set.
+Command:
+```
+whiplash --irregular --combine \
+  --file-label API api.log \
+  --file-label WORKER worker.log \
+  --output case.log
+```
 
-### `--validate`
-- Prints `Processed N items` followed by either `Config.toml correct 🟢`, or on the first block with no matching pattern: the validation error, a diagnostic breakdown of the closest-matching item's parts (colored: green for matched parts, red for the part that failed, dim for parts not yet attempted), and `Validation failed, issue with Config.toml 🔴`. Exits with status `1` on failure.
+Merges records from multiple irregular log files into one chronological case log **without** parsing them into the configured item types.
 
-### `--side-by-side`
-- Requires an interactive terminal (stdout must be a TTY); errors immediately otherwise.
-- Merges clean and dirty items into rows, in document order: a matched pair shares a row; an unmatched item gets its own row with the other side blank. Each row shows the same id number and a status icon on both sides (✓ matched at the same original index, ~ matched only via `--threshold`, ✗ no counterpart) so a shared id/icon signals a matching pair.
-- A minimap strip above the table shows one column per row (or, once there are more rows than columns, one column per bucket of rows, colored by the worst status in the bucket): green for an aligned match, gray for a threshold-shifted match (with a connecting line between the clean/dirty strips), red for no match. A live marker tracks the current viewport position on the minimap as you navigate.
-- Lays out the full comparison regardless of where `--max-failed` early-stop would have cut off the plain-text output.
-- Navigation: `↑`/`↓` or `j`/`k` move one row; `←`/`→` or `h`/`l` jump several rows at once; `PageUp`/`PageDown` scroll a page; `Home`/`g` and `End`/`G` jump to the start/end; `q`/`Esc`/`Ctrl-C` quit.
-- Search: `/` opens a search prompt; typed characters build the query, `Enter` confirms (jumping to the first match at or after the current row) and `Esc` cancels. A match is a row whose clean or dirty content contains the query (case-insensitive); `n`/`N` cycle to the next/previous match, wrapping around. The matched substring is highlighted on whichever side(s) contain it; the footer shows the query and match position (e.g. `2/4 matches`).
+### Flags
+- `--irregular` — treat inputs as irregular logs; currently only meaningful with `--combine` (each requires the other).
+- `--combine` — enables combine mode. Mutually exclusive with comparison/validation: `--config`, `--validate`, `--side-by-side`, `--threshold`, `--max-failed`, and the positional log arguments.
+- `--file-label <LABEL> <PATH>` — one labeled input per occurrence; at least two pairs required. Labels must start with an alphanumeric character and contain only alphanumerics, `_`, `.`, or `-` (so the emitted `[LABEL]` prefix cannot be malformed); duplicates are rejected.
+- `--output <PATH>` — required; receives the complete combined log. The output is written to a sibling temporary file and atomically renamed into place, so a failure at any stage (reading, parsing, trimming, writing) never partially replaces an existing file.
+
+### Input metadata header
+The first line of every input file must be a metadata header of the form:
+```text
+{ marker_regex : "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z)" }
+```
+Serialization: a braced object holding the single key `marker_regex` (double quotes around the key optional), a colon, and a double-quoted string value using JSON escaping (`\\` for a literal backslash, `\"`, `\n`, `\r`, `\t`, `\/`). The header is metadata only and never appears in the combined output. Missing/invalid headers and invalid regexes are errors that name the input path; an empty input is an error.
+
+### Record boundaries
+- A record begins at a line matching the file's `marker_regex` and contains that line plus every following line up to, but not including, the next marker match or EOF (records may be multiline).
+- Content between the header and the first marker match is an error (reported with file and line number), not silently discarded.
+- A file whose body contains no marker match at all is an error.
+
+### Chronological keys
+The marker match supplies the record's chronological key: the named `timestamp` capture when present, otherwise the complete match. Keys are parsed as timestamps; accepted formats are RFC 3339 (`Z` or numeric offset, optional fractional seconds) and the naive forms `YYYY-MM-DDTHH:MM:SS[.frac]` / `YYYY-MM-DD HH:MM:SS[.frac]`, which are interpreted as UTC. An unparseable key is an error reported with file and line number.
+
+### Merged output
+Records from all inputs are merged by ascending timestamp. Records with equal timestamps keep a deterministic, stable order: `--file-label` order first, then source-record order within a file. The first line of each record is prefixed with `[LABEL] `; continuation lines are emitted verbatim. Every line is newline-terminated.
+
+```text
+[API] 2026-07-13T09:42:01.120Z request started
+continuation line from the same record
+[WORKER] 2026-07-13T09:42:01.240Z job received
+```
 
 ## Ordering and Precedence Rules
 - Item patterns are tried in configuration order; the first match wins.
