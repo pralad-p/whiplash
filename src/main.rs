@@ -33,10 +33,21 @@ fn style(code: &str, text: &str) -> String {
 
 #[derive(Parser)]
 #[command(name = "whiplash", version = VERSION, about = "Compare two log files using configurable regex patterns")]
+#[command(after_help = "\
+COMBINE MODE:
+    whiplash --irregular --combine \\
+        --file-label API api.log --file-label WORKER worker.log \\
+        --output case.log
+
+    Merges records from two or more irregular logs chronologically. Each
+    input's first line must be a metadata header such as:
+        { marker_regex : \"^(?<timestamp>\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z)\" }
+    Combine mode is incompatible with comparison and validation flags
+    (--config, --validate, --side-by-side, --threshold, --max-failed).")]
 struct Cli {
     /// Path to the TOML configuration file
-    #[arg(long)]
-    config: PathBuf,
+    #[arg(long, required_unless_present = "combine")]
+    config: Option<PathBuf>,
 
     /// Override index_threshold from config
     #[arg(long)]
@@ -55,8 +66,30 @@ struct Cli {
     #[arg(long, conflicts_with = "validate")]
     side_by_side: bool,
 
+    /// Treat inputs as irregular logs (no config-based item parsing);
+    /// currently only meaningful with --combine
+    #[arg(long, requires = "combine")]
+    irregular: bool,
+
+    /// Merge labeled irregular logs chronologically into --output
+    #[arg(
+        long,
+        requires = "irregular",
+        conflicts_with_all = ["config", "validate", "side_by_side", "threshold", "max_failed", "clean_log", "dirty_log"]
+    )]
+    combine: bool,
+
+    /// Labeled input for --combine; repeatable, at least two pairs required
+    #[arg(long = "file-label", num_args = 2, value_names = ["LABEL", "PATH"], action = clap::ArgAction::Append, requires = "combine")]
+    file_label: Vec<String>,
+
+    /// Output path for the combined log (required with --combine)
+    #[arg(long, requires = "combine")]
+    output: Option<PathBuf>,
+
     /// Clean (reference) log file
-    clean_log: PathBuf,
+    #[arg(required_unless_present = "combine")]
+    clean_log: Option<PathBuf>,
 
     /// Dirty (test) log file
     dirty_log: Option<PathBuf>,
@@ -871,12 +904,25 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    info!(config = %cli.config.display(), "loading configuration");
-    let config = load_config(&cli.config, &cli)?;
+    if cli.combine {
+        return combine::run(&cli);
+    }
+
+    let config_path = cli
+        .config
+        .as_ref()
+        .context("missing required argument: --config")?;
+    let clean_log = cli
+        .clean_log
+        .as_ref()
+        .context("missing required argument: <CLEAN_LOG>")?;
+
+    info!(config = %config_path.display(), "loading configuration");
+    let config = load_config(config_path, &cli)?;
 
     if cli.validate {
-        let file = fs::File::open(&cli.clean_log)
-            .with_context(|| format!("failed to open '{}'", cli.clean_log.display()))?;
+        let file = fs::File::open(clean_log)
+            .with_context(|| format!("failed to open '{}'", clean_log.display()))?;
         let reader = std::io::BufReader::new(file);
         let result = validate(reader, &config)?;
         writeln!(anstream::stdout(), "{}", result.output)?;
@@ -891,7 +937,7 @@ fn run() -> Result<()> {
         .as_ref()
         .context("missing required argument: <DIRTY_LOG>")?;
 
-    let clean_content = read_file_lossy(&cli.clean_log)?;
+    let clean_content = read_file_lossy(clean_log)?;
     let dirty_content = read_file_lossy(dirty_log)?;
 
     info!("parsing clean log");
@@ -929,6 +975,7 @@ fn read_file_lossy(path: &PathBuf) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+mod combine;
 mod tui;
 
 // ── Tests ────────────────────────────────────────────────────────────
